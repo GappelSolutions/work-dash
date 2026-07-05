@@ -1,0 +1,26 @@
+[package]
+name = "work-dash-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+axum-extra = { version = "0.12", features = ["cookie-signed"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
+tokio-stream = { version = "0.1", features = ["sync", "time"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "migrate"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+maud = { version = "0.27", features = ["axum"] }
+subtle = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"

@@ -1,10 +1,12 @@
 mod app;
 mod aquarium;
 mod bigtext;
+mod net;
 mod seed;
 mod ui;
 
 use std::io;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -16,6 +18,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::DefaultTerminal;
 
 use app::{App, Page};
+use net::{NetConfig, NetEvent};
 
 const TICK: Duration = Duration::from_millis(50);
 
@@ -29,7 +32,13 @@ fn main() -> io::Result<()> {
 }
 
 fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
-    let mut app = App::new();
+    let net_config = NetConfig::from_env();
+    let (tx, rx) = mpsc::channel::<NetEvent>();
+    if let Some(cfg) = net_config.clone() {
+        net::spawn(cfg, tx);
+    }
+
+    let mut app = App::new(net_config);
     let mut last_tick = Instant::now();
 
     while !app.should_quit {
@@ -45,6 +54,9 @@ fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
                 }
                 _ => {}
             }
+        }
+        while let Ok(ev) = rx.try_recv() {
+            app.apply_net_event(ev);
         }
         if last_tick.elapsed() >= TICK {
             app.on_tick();

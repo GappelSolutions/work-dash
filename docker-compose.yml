@@ -1,0 +1,25 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      DATABASE_URL: "sqlite:///data/work-dash.db"
+      SESSION_PASSWORD: "${SESSION_PASSWORD:-changeme}"
+      SESSION_SECRET: "${SESSION_SECRET:-dev-secret-change-me}"
+      API_KEYS: "${API_KEYS:-dev-key}"
+      TZ: "${TZ:-Europe/Berlin}"
+    volumes:
+      - work-dash-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  work-dash-data:

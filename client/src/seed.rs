@@ -1,4 +1,6 @@
-//! Seed data only — persistence and the laptop push channel come later.
+//! Offline fallback data — used only when `WORK_DASH_SERVER_URL` /
+//! `WORK_DASH_API_KEY` aren't set (see `net.rs`), so the client still runs
+//! standalone.
 
 use chrono::{Duration, Local};
 
@@ -55,6 +57,7 @@ pub fn kanban() -> Vec<Column> {
             .map(|(text, phase)| Card {
                 text: text.to_string(),
                 phase: *phase,
+                id: None,
             })
             .collect(),
     };
