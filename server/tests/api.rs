@@ -29,6 +29,7 @@ async fn test_router() -> (Router, tempfile::TempDir) {
         api_keys: Arc::new(api_keys),
         session_password: Arc::new(PASSWORD.to_string()),
         cookie_key: work_dash_server::derive_cookie_key("test-secret"),
+        graph_webhook_client_state: None,
     };
 
     (work_dash_server::build_router(state), dir)

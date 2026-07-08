@@ -4,6 +4,7 @@ pub mod cms;
 pub mod db;
 pub mod error;
 pub mod events;
+pub mod graph_webhook;
 pub mod icons;
 pub mod models;
 pub mod sse;
@@ -47,7 +48,11 @@ pub fn build_router(state: AppState) -> Router {
             get(calendar::get_calendar).put(calendar::put_calendar),
         )
         .route("/teams", get(teams::get_teams).put(teams::put_teams))
-        .route("/events", get(sse::sse_handler));
+        .route("/events", get(sse::sse_handler))
+        .route(
+            "/graph/notifications",
+            post(graph_webhook::receive_notifications),
+        );
 
     Router::new()
         .route("/", get(cms::board_page))
@@ -91,6 +96,7 @@ pub async fn run() -> anyhow::Result<()> {
         std::env::var("SESSION_PASSWORD").expect("SESSION_PASSWORD must be set");
     let session_secret = std::env::var("SESSION_SECRET").expect("SESSION_SECRET must be set");
     let api_keys = parse_api_keys(&std::env::var("API_KEYS").unwrap_or_default());
+    let graph_webhook_client_state = std::env::var("GRAPH_WEBHOOK_CLIENT_STATE").ok();
 
     let pool = db::connect(&database_url).await?;
 
@@ -100,6 +106,7 @@ pub async fn run() -> anyhow::Result<()> {
         api_keys: Arc::new(api_keys),
         session_password: Arc::new(session_password),
         cookie_key: derive_cookie_key(&session_secret),
+        graph_webhook_client_state,
     };
 
     let app = build_router(state);

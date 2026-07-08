@@ -19,8 +19,17 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 /// Routes reachable without a session cookie or API key.
+///
+/// `/api/graph/notifications` is public because Microsoft Graph delivers
+/// webhooks with neither a bearer token nor our session cookie — it's
+/// guarded instead by the shared `clientState` secret checked inside
+/// `graph_webhook::receive_notifications`.
 fn is_public(path: &str) -> bool {
-    path == "/health" || path == "/login" || path == "/logout" || path.starts_with("/assets/")
+    path == "/health"
+        || path == "/login"
+        || path == "/logout"
+        || path.starts_with("/assets/")
+        || path == "/api/graph/notifications"
 }
 
 pub async fn auth_guard(

@@ -13,6 +13,14 @@ pub async fn put_teams(
     State(state): State<AppState>,
     Json(input): Json<TeamsEventIn>,
 ) -> AppResult<(StatusCode, Json<TeamsEvent>)> {
+    let event = insert_teams_event(&state, input).await?;
+    Ok((StatusCode::CREATED, Json(event)))
+}
+
+/// Shared by the `/api/teams` PUT handler and the Graph webhook
+/// (`graph_webhook::receive_notifications`) so both ingest paths insert,
+/// publish, and shape the response the same way.
+pub async fn insert_teams_event(state: &AppState, input: TeamsEventIn) -> AppResult<TeamsEvent> {
     let now = time::now_iso();
     let payload_json = input.payload.as_ref().map(|p| p.to_string());
 
@@ -38,7 +46,7 @@ pub async fn put_teams(
     state
         .bus
         .publish(ServerEvent::TeamsEventFired(event.clone()));
-    Ok((StatusCode::CREATED, Json(event)))
+    Ok(event)
 }
 
 #[derive(Debug, Deserialize)]
