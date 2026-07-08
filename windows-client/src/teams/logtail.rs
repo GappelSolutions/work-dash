@@ -112,9 +112,20 @@ impl CallSource for LogTailCallSource {
                 match active {
                     Some(path) => {
                         if current_path.as_deref() != Some(path.as_path()) {
-                            // New (or first) log file — start tailing from
-                            // its current end so we don't replay history.
-                            offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                            if current_path.is_none() {
+                                // First attach at startup: seek to end so we
+                                // don't replay a whole prior session's calls.
+                                offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                            } else {
+                                // Mid-run rotation: Teams closed the old log
+                                // and opened a fresh one. Read the new file
+                                // from the start (offset 0) — it begins empty
+                                // and grows from here, so byte 0 is the start
+                                // of new content, and a call that's the very
+                                // first line written after rotation is caught
+                                // rather than skipped by seeking to end.
+                                offset = 0;
+                            }
                             current_path = Some(path);
                         }
 
@@ -223,6 +234,34 @@ mod tests {
             .open(&log_path)
             .unwrap();
         writeln!(file, "new line {marker}").unwrap();
+
+        let call = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(call.caller, "Unknown caller");
+    }
+
+    #[test]
+    fn call_on_freshly_rotated_log_is_not_missed() {
+        // Regression: on mid-run rotation Teams opens a new empty log; a call
+        // that's the FIRST line written to it must be caught, not skipped by
+        // seeking to end-of-file on the switch.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = "HfpVoipCallCoordinatorImpl: reportIncomingCall for callId: y";
+
+        // Startup: one existing log with only history — must be skipped.
+        let first = dir.path().join("MSTeams_2026-07-08_09-00-00.00.log");
+        std::fs::write(&first, "boot line, not a call\n").unwrap();
+
+        let source = LogTailCallSource {
+            log_dir: dir.path().to_path_buf(),
+            poll: Duration::from_millis(20),
+        };
+        let rx = source.start();
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        // Rotation: a newer main log appears whose very first line is a call.
+        thread::sleep(Duration::from_millis(30));
+        let rotated = dir.path().join("MSTeams_2026-07-08_10-00-00.01.log");
+        std::fs::write(&rotated, format!("{marker}\n")).unwrap();
 
         let call = rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(call.caller, "Unknown caller");
