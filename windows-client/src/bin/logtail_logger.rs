@@ -38,12 +38,16 @@ fn main() {
     let mut offset: u64 = 0;
 
     loop {
+        // Match the source's filter (`teams::logtail::is_main_log`): only the
+        // main `MSTeams_*.log` carries the call marker. The dir is dominated
+        // by `MSTeamsBackgroundEcs_*.log` heartbeats that are frequently more
+        // recent, so a broad filter would tail the wrong file.
         let active = std::fs::read_dir(&dir).ok().and_then(|rd| {
             rd.filter_map(|e| e.ok())
                 .filter(|e| {
                     let name = e.file_name();
                     let name = name.to_string_lossy();
-                    name.ends_with(".log") || name.ends_with(".txt")
+                    name.starts_with("MSTeams_") && name.ends_with(".log")
                 })
                 .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
                 .map(|e| e.path())
