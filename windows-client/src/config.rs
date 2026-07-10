@@ -9,11 +9,13 @@ const DEFAULT_CALENDAR_POLL_SECS: u64 = 300;
 const DEFAULT_PRESENCE_POLL_SECS: u64 = 60;
 const DEFAULT_CALENDAR_WINDOW_DAYS_PAST: i64 = 1;
 const DEFAULT_CALENDAR_WINDOW_DAYS_FUTURE: i64 = 14;
-// `logtail` not `window`: calibration on a real box showed new Teams renders
-// the ring popup's caller text inside a WebView2 (Chrome_WidgetWin children)
-// whose GetWindowText is empty, so the window watcher can't read it without
-// full UI Automation — whereas the log carries a reliable call-start marker.
-const DEFAULT_TEAMS_CALL_SOURCE: &str = "logtail";
+// `window`: the UIA ring-window watcher is the only headset-independent call
+// detector. A full day of log capture produced zero call-specific markers
+// without a Bluetooth/HFP headset, so `logtail` can't reliably see calls;
+// it stays available as an opt-in for chat-ish activity. The window watcher
+// reads the ring popup's WebView2 accessibility tree for Accept/Decline
+// controls — see `teams::window_win`.
+const DEFAULT_TEAMS_CALL_SOURCE: &str = "window";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -160,7 +162,7 @@ mod tests {
             config.calendar_window_days_future,
             DEFAULT_CALENDAR_WINDOW_DAYS_FUTURE
         );
-        assert_eq!(config.teams_call_source, "logtail");
+        assert_eq!(config.teams_call_source, "window");
         assert_eq!(config.graph_webhook_public_url, None);
         assert_eq!(config.graph_webhook_client_state, None);
     }

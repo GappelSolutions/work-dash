@@ -1,58 +1,87 @@
-//! `CallSource` that watches for Teams' own on-screen ring/toast window
-//! directly, via `SetWinEventHook`, instead of the OS notification pipeline.
+//! `CallSource` that detects an incoming Teams call by inspecting Teams' own
+//! ring popup window via UI Automation (UIA), instead of the OS notification
+//! pipeline (which new Teams bypasses) or the log (which carries no reliable,
+//! headset-independent call marker — a full workday of capture produced zero
+//! call-specific log lines without a Bluetooth/HFP headset connected).
 //!
-//! Why: new Teams (WebView2-based) draws its "Show in Banner" popup as its
-//! own always-on-top Win32 window rather than routing it through the real
-//! Windows toast/AppNotification system — confirmed empirically (see
-//! `toast-log.txt` calibration run: `UserNotificationListener` caught
-//! Outlook and system toasts but zero Teams notifications over an hour).
-//! `listener_win::ToastCallSource` therefore cannot see Teams calls at all
-//! on current Teams versions. This source reads the actual rendered window
-//! instead, which exists regardless of whether Teams registers with the OS
-//! toast pipeline.
+//! How it works:
+//!   1. `SetWinEventHook` watches for windows becoming visible.
+//!   2. We filter to Teams' notification popup: a top-level `TeamsWebView`
+//!      window with the `WS_EX_TOPMOST` extended style (the main Teams window
+//!      is also `TeamsWebView` but is not topmost, so this excludes it).
+//!   3. The HWND is handed to a worker thread that (with COM initialised)
+//!      reads the window's UIA subtree. The popup's content is a WebView2,
+//!      whose accessibility tree exposes the rendered controls — crucially,
+//!      an incoming call shows **Accept** and **Decline** buttons, which a
+//!      chat/mention toast never does. Matching those control names (EN + DE)
+//!      is what distinguishes a call from any other toast.
 //!
-//! KNOWN LIMITATION (from calibration on a real box): the ring popup is a
-//! `WS_EX_TOPMOST` `TeamsWebView` window (log tag `Notifications`) whose
-//! visible content — including the caller name — is rendered inside a
-//! WebView2 (`Chrome_WidgetWin_*` / `Chrome_RenderWidgetHostHWND` children).
-//! `GetWindowText` on those children returns EMPTY (WebView2 paints to the
-//! GPU, not window titles), so `collect_text_lines` here yields nothing and
-//! this source cannot currently detect a call by window text alone. Reading
-//! the caller would require full UI Automation (`IUIAutomation` +
-//! `ElementFromHandle`, walking the WebView2 provider tree) — left as future
-//! work. Until then the reliable detector is `logtail::LogTailCallSource`
-//! (the default `TEAMS_CALL_SOURCE`), which matches a confirmed call-start
-//! marker in Teams' own log. Recalibrate with `cargo run --bin window_logger`
-//! if a future Teams build changes this.
+//! The UIA tree isn't populated the instant the window shows, so the worker
+//! retries for a short window before giving up.
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
 use std::thread;
+use std::time::Duration;
 
-use windows::core::BOOL;
-use windows::Win32::Foundation::{HWND, LPARAM};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
+};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
+use windows::Win32::UI::Accessibility::{
+    CUIAutomation, IUIAutomation, IUIAutomationElement, SetWinEventHook, UnhookWinEvent,
+    HWINEVENTHOOK, TreeScope_Descendants,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, EnumChildWindows, GetMessageW, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, TranslateMessage, EVENT_OBJECT_CREATE, EVENT_OBJECT_SHOW, MSG,
-    WINEVENT_OUTOFCONTEXT,
+    DispatchMessageW, GetClassNameW, GetMessageW, GetWindowLongPtrW, GetWindowThreadProcessId,
+    TranslateMessage, EVENT_OBJECT_SHOW, GWL_EXSTYLE, MSG, WINEVENT_OUTOFCONTEXT, WS_EX_TOPMOST,
 };
 
-use super::classify::CallClassifier;
+use super::classify::{CallClassifier, IncomingCall};
 use super::source::CallSource;
 
 /// New Teams' process image name. Classic Teams (`Teams.exe`) is being
 /// retired; both are matched so the source still works during the interim.
 const TEAMS_PROCESS_NAMES: &[&str] = &["ms-teams.exe", "teams.exe"];
 
-// The hook callback runs on the thread that called `SetWinEventHook` and
-// has no way to carry a closure's captured state through the raw win32
-// callback pointer, so the sender and classifier are stashed here instead.
-static SINK: Mutex<Option<(Sender<super::classify::IncomingCall>, CallClassifier)>> =
-    Mutex::new(None);
+/// The ring popup is a `TeamsWebView` window; so is the main window, but only
+/// the popup is `WS_EX_TOPMOST`.
+const NOTIFICATION_WINDOW_CLASS: &str = "TeamsWebView";
+
+/// UIA control names (lowercased) that only an incoming-call ring shows.
+/// Chat/mention toasts expose "Reply"/"Antworten" instead, never these.
+/// German included — the target user's Teams UI is German.
+const CALL_DECLINE_NAMES: &[&str] = &["decline", "ablehnen", "reject"];
+const CALL_ACCEPT_NAMES: &[&str] = &[
+    "accept",
+    "annehmen",
+    "akzeptieren",
+    "accept with audio",
+    "accept with video",
+    "mit audio",
+    "mit video",
+];
+
+/// Names we should never treat as the caller (they're the action buttons).
+const BUTTON_NAMES: &[&str] = &[
+    "decline",
+    "ablehnen",
+    "reject",
+    "accept",
+    "annehmen",
+    "akzeptieren",
+    "audio",
+    "video",
+    "mit audio",
+    "mit video",
+];
+
+// The raw win32 hook callback can't carry captured state, so the channel the
+// hook uses to hand HWNDs to the UIA worker is stashed here.
+static HWND_TX: Mutex<Option<Sender<isize>>> = Mutex::new(None);
 
 pub struct WindowCallSource {
     classifier: CallClassifier,
@@ -60,6 +89,9 @@ pub struct WindowCallSource {
 
 impl WindowCallSource {
     pub fn new(classifier: CallClassifier) -> Self {
+        // classifier is retained for API symmetry with the other sources /
+        // possible future phrase-based caller filtering; call detection here
+        // is structural (Accept/Decline controls), not phrase-based.
         WindowCallSource { classifier }
     }
 }
@@ -85,7 +117,7 @@ fn process_name_for_window(hwnd: HWND) -> Option<String> {
     }
 }
 
-fn is_teams_window(hwnd: HWND) -> bool {
+fn is_teams_process(hwnd: HWND) -> bool {
     process_name_for_window(hwnd)
         .map(|path| {
             let lower = path.to_lowercase();
@@ -94,90 +126,163 @@ fn is_teams_window(hwnd: HWND) -> bool {
         .unwrap_or(false)
 }
 
-fn window_text(hwnd: HWND) -> Option<String> {
+fn class_name(hwnd: HWND) -> String {
     unsafe {
-        let len = GetWindowTextLengthW(hwnd);
-        if len <= 0 {
-            return None;
-        }
-        let mut buf = vec![0u16; len as usize + 1];
-        let copied = GetWindowTextW(hwnd, &mut buf);
-        if copied <= 0 {
-            return None;
-        }
-        Some(String::from_utf16_lossy(&buf[..copied as usize]))
+        let mut buf = [0u16; 256];
+        let len = GetClassNameW(hwnd, &mut buf);
+        String::from_utf16_lossy(&buf[..len.max(0) as usize])
     }
 }
 
-/// Collects the title text of `hwnd` and every descendant child window —
-/// approximates a UIA text-tree walk without pulling in the full
-/// `IUIAutomation` COM surface. Good enough for WebView2-hosted content
-/// where visible text often ends up on child window titles/accessible
-/// names; revisit with real `IUIAutomation` if `window_logger` calibration
-/// shows this misses the caller name.
-fn collect_text_lines(hwnd: HWND) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(t) = window_text(hwnd) {
-        if !t.trim().is_empty() {
-            lines.push(t);
-        }
-    }
-
-    unsafe extern "system" fn enum_child(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let lines = &mut *(lparam.0 as *mut Vec<String>);
-        if let Some(t) = window_text(hwnd) {
-            if !t.trim().is_empty() {
-                lines.push(t);
-            }
-        }
-        BOOL(1)
-    }
-
+fn is_topmost(hwnd: HWND) -> bool {
     unsafe {
-        let _ = EnumChildWindows(
-            Some(hwnd),
-            Some(enum_child),
-            LPARAM(&mut lines as *mut _ as isize),
-        );
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        ex & WS_EX_TOPMOST.0 != 0
     }
-    lines
+}
+
+/// Cheap pre-filter (no UIA) run in the hook callback: is this plausibly the
+/// Teams ring/notification popup worth a UIA inspection?
+fn looks_like_notification_window(hwnd: HWND) -> bool {
+    !hwnd.0.is_null()
+        && class_name(hwnd) == NOTIFICATION_WINDOW_CLASS
+        && is_topmost(hwnd)
+        && is_teams_process(hwnd)
 }
 
 unsafe extern "system" fn win_event_proc(
     _hook: HWINEVENTHOOK,
     _event: u32,
     hwnd: HWND,
-    _id_object: i32,
+    id_object: i32,
     _id_child: i32,
     _thread_id: u32,
     _time: u32,
 ) {
-    if hwnd.0.is_null() || !is_teams_window(hwnd) {
+    // OBJID_WINDOW == 0: only whole-window show events, not child objects.
+    if id_object != 0 {
         return;
     }
-
-    let lines = collect_text_lines(hwnd);
-    if lines.is_empty() {
+    if !looks_like_notification_window(hwnd) {
         return;
     }
-
-    if let Ok(guard) = SINK.lock() {
-        if let Some((tx, classifier)) = guard.as_ref() {
-            if let Some(call) = classifier.classify_lines(&lines) {
-                let _ = tx.send(call);
-            }
+    if let Ok(guard) = HWND_TX.lock() {
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.send(hwnd.0 as isize);
         }
     }
 }
 
-impl CallSource for WindowCallSource {
-    fn start(self) -> Receiver<super::classify::IncomingCall> {
-        let (tx, rx) = mpsc::channel();
-        *SINK.lock().expect("SINK mutex poisoned") = Some((tx, self.classifier));
+/// Reads every UIA element name under `hwnd`. Returns `None` if UIA can't
+/// reach the window yet.
+fn read_uia_names(automation: &IUIAutomation, hwnd: HWND) -> Option<Vec<String>> {
+    unsafe {
+        let element: IUIAutomationElement = automation.ElementFromHandle(hwnd).ok()?;
+        let condition = automation.CreateTrueCondition().ok()?;
+        let all = element.FindAll(TreeScope_Descendants, &condition).ok()?;
+        let len = all.Length().ok()?;
+        let mut names = Vec::new();
+        for i in 0..len {
+            if let Ok(e) = all.GetElement(i) {
+                if let Ok(name) = e.CurrentName() {
+                    let s = name.to_string();
+                    if !s.trim().is_empty() {
+                        names.push(s);
+                    }
+                }
+            }
+        }
+        Some(names)
+    }
+}
 
+/// Decides whether the collected UIA names describe an incoming call, and if
+/// so extracts a best-effort caller. Pure — unit-tested.
+fn classify_call(names: &[String]) -> Option<IncomingCall> {
+    let lower: Vec<String> = names.iter().map(|s| s.to_lowercase()).collect();
+
+    let has_decline = lower
+        .iter()
+        .any(|n| CALL_DECLINE_NAMES.iter().any(|d| n.contains(d)));
+    let has_accept = lower
+        .iter()
+        .any(|n| CALL_ACCEPT_NAMES.iter().any(|a| n.contains(a)));
+
+    // A ring shows both Accept and Decline. Requiring both avoids matching a
+    // stray "Decline"/"Accept" label elsewhere in the UI.
+    if !(has_decline && has_accept) {
+        return None;
+    }
+
+    // Best-effort caller: the first name that isn't an action button and
+    // isn't obviously boilerplate. Teams typically renders the caller name
+    // prominently in the toast; fall back if we can't isolate it.
+    let caller = names
+        .iter()
+        .map(|s| s.trim())
+        .find(|s| {
+            let low = s.to_lowercase();
+            !s.is_empty()
+                && !BUTTON_NAMES.iter().any(|b| low.contains(b))
+                && !low.contains("microsoft teams")
+                && !low.contains("incoming")
+                && !low.contains("calling")
+                && !low.contains("eingehend") // DE "incoming"
+                && s.len() > 1
+        })
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "Teams call".to_string());
+
+    Some(IncomingCall { caller })
+}
+
+impl CallSource for WindowCallSource {
+    fn start(self) -> Receiver<IncomingCall> {
+        let (call_tx, call_rx) = mpsc::channel::<IncomingCall>();
+        let (hwnd_tx, hwnd_rx) = mpsc::channel::<isize>();
+        *HWND_TX.lock().expect("HWND_TX mutex poisoned") = Some(hwnd_tx);
+        let _ = &self.classifier;
+
+        // Worker thread: owns COM + UIA, inspects each candidate window.
+        thread::spawn(move || unsafe {
+            if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
+                tracing::error!("CoInitializeEx failed in Teams UIA worker");
+                return;
+            }
+            let automation: IUIAutomation =
+                match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::error!(?e, "failed to create UIAutomation instance");
+                        return;
+                    }
+                };
+
+            for raw in hwnd_rx {
+                let hwnd = HWND(raw as *mut _);
+                // The WebView2 accessibility tree lags the window's show by a
+                // beat; retry briefly before giving up.
+                let mut emitted = false;
+                for _ in 0..10 {
+                    if let Some(names) = read_uia_names(&automation, hwnd) {
+                        if let Some(call) = classify_call(&names) {
+                            if call_tx.send(call).is_err() {
+                                return;
+                            }
+                            emitted = true;
+                            break;
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(200));
+                }
+                let _ = emitted;
+            }
+        });
+
+        // Hook thread: message pump so WinEvent callbacks fire.
         thread::spawn(move || unsafe {
             let hook = SetWinEventHook(
-                EVENT_OBJECT_CREATE,
+                EVENT_OBJECT_SHOW,
                 EVENT_OBJECT_SHOW,
                 None,
                 Some(win_event_proc),
@@ -186,21 +291,82 @@ impl CallSource for WindowCallSource {
                 WINEVENT_OUTOFCONTEXT,
             );
             if hook.is_invalid() {
-                tracing::error!("SetWinEventHook failed for Teams window watcher");
+                tracing::error!("SetWinEventHook failed for Teams ring watcher");
                 return;
             }
-
-            // WinEvent hooks deliver via the thread's message queue — needs
-            // a real message pump, not a sleep loop.
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
-
             let _ = UnhookWinEvent(hook);
         });
 
-        rx
+        call_rx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accept_and_decline_present_is_a_call() {
+        let names = vec![
+            "Sarah Lee".to_string(),
+            "Incoming call".to_string(),
+            "Accept".to_string(),
+            "Decline".to_string(),
+        ];
+        assert_eq!(
+            classify_call(&names),
+            Some(IncomingCall {
+                caller: "Sarah Lee".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn german_accept_decline_is_a_call() {
+        let names = vec![
+            "Max Mustermann".to_string(),
+            "Eingehender Anruf".to_string(),
+            "Annehmen".to_string(),
+            "Ablehnen".to_string(),
+        ];
+        assert_eq!(
+            classify_call(&names),
+            Some(IncomingCall {
+                caller: "Max Mustermann".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn chat_toast_with_only_reply_is_not_a_call() {
+        let names = vec![
+            "Sarah Lee".to_string(),
+            "Hey are you around?".to_string(),
+            "Reply".to_string(),
+        ];
+        assert_eq!(classify_call(&names), None);
+    }
+
+    #[test]
+    fn decline_without_accept_is_not_a_call() {
+        // Guards against a stray "Decline"-like label elsewhere.
+        let names = vec!["Decline meeting".to_string()];
+        assert_eq!(classify_call(&names), None);
+    }
+
+    #[test]
+    fn caller_falls_back_when_only_buttons_present() {
+        let names = vec!["Accept".to_string(), "Decline".to_string()];
+        assert_eq!(
+            classify_call(&names),
+            Some(IncomingCall {
+                caller: "Teams call".to_string()
+            })
+        );
     }
 }
