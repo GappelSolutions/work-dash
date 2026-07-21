@@ -106,10 +106,6 @@ pub struct App {
     /// offline (seed data, no net thread running).
     net_config: Option<NetConfig>,
     pub connected: bool,
-    /// True when `Page::Idle` was entered automatically by a disconnect
-    /// (not the user's manual "leave" button) — lets a reconnect return the
-    /// user to `Clock` without also yanking them out of a deliberate leave.
-    auto_idle: bool,
 }
 
 fn empty_columns() -> Vec<Column> {
@@ -146,8 +142,15 @@ impl App {
             columns: if networked { empty_columns() } else { seed::kanban() },
             net_config,
             connected: false,
-            auto_idle: false,
         }
+    }
+
+    /// `true` when `WORK_DASH_SERVER_URL`/`WORK_DASH_API_KEY` were set at
+    /// startup — distinguishes "briefly disconnected" from "never wired to
+    /// a server, running on seed data by design" so the UI only warns in
+    /// the former case.
+    pub fn networked(&self) -> bool {
+        self.net_config.is_some()
     }
 
     pub fn goto(&mut self, page: Page) {
@@ -164,17 +167,9 @@ impl App {
         match ev {
             NetEvent::Connected => {
                 self.connected = true;
-                if self.page == Page::Idle && self.auto_idle {
-                    self.auto_idle = false;
-                    self.goto(Page::Clock);
-                }
             }
             NetEvent::Disconnected => {
                 self.connected = false;
-                if self.page != Page::Idle {
-                    self.auto_idle = true;
-                    self.goto(Page::Idle);
-                }
             }
             NetEvent::Snapshot(snap) => {
                 self.columns = columns_from_tasks(&snap.tasks);

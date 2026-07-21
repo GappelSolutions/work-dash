@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, CalendarEvent, NotifKind};
+use crate::app::{App, CalendarEvent, NotifKind, Phase};
 use crate::bigtext;
 
 /// One appointment row: title left (green + marker if in progress, else
@@ -56,8 +56,38 @@ pub fn window_width(area: Rect) -> u16 {
     clock_w.min(area.width)
 }
 
+/// Height reserved at the top of the page for the offline banner, whether or
+/// not it's currently shown — keeps the centered stack below from jumping
+/// when the connection drops/recovers.
+const OFFLINE_BANNER_H: u16 = 3;
+
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let now = Local::now();
+
+    let show_offline_banner =
+        app.networked() && !app.connected && area.height > OFFLINE_BANNER_H;
+    let area = if show_offline_banner {
+        let banner = Rect::new(area.x, area.y, area.width, OFFLINE_BANNER_H);
+        f.render_widget(Clear, banner);
+        f.render_widget(
+            Paragraph::new(Line::from(
+                "  SERVER UNREACHABLE — showing last known data  "
+                    .red()
+                    .bold(),
+            ))
+            .centered()
+            .block(Block::bordered().border_style(Style::default().fg(Color::Red))),
+            banner,
+        );
+        Rect::new(
+            area.x,
+            area.y + OFFLINE_BANNER_H,
+            area.width,
+            area.height - OFFLINE_BANNER_H,
+        )
+    } else {
+        area
+    };
     let time = now.format("%H:%M:%S").to_string();
     let date = now.format("%A, %d %B %Y").to_string();
 
@@ -123,10 +153,17 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             Span::raw(n.text.clone()),
         ]));
     }
-    if items.is_empty() {
-        items.push(Line::from(" no notifications".dark_gray()));
-    }
-    let notif_h_raw = items.len() as u16 + 2;
+    let notif_h_raw = if items.is_empty() { 0 } else { items.len() as u16 + 2 };
+
+    // Active (WIP) tasks across all kanban columns — hidden entirely when none.
+    let task_lines: Vec<Line> = app
+        .columns
+        .iter()
+        .flat_map(|c| c.cards.iter())
+        .filter(|c| c.phase == Phase::Wip)
+        .map(|c| Line::from(c.text.clone().yellow()))
+        .collect();
+    let tasks_h_raw = if task_lines.is_empty() { 0 } else { task_lines.len() as u16 + 2 };
 
     // Next-break countdown, sized to content.
     let remaining = app.time_until_break();
@@ -145,7 +182,10 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     // one block, centered vertically (and horizontally) in the page instead
     // of pinned to the top.
     let gap = 1;
-    let total_h = break_h_raw + gap + clock_h + gap + appt_h_raw + gap + notif_h_raw;
+    let tasks_block_h = if tasks_h_raw > 0 { gap + tasks_h_raw } else { 0 };
+    let notif_block_h = if notif_h_raw > 0 { gap + notif_h_raw } else { 0 };
+    let total_h =
+        break_h_raw + gap + clock_h + tasks_block_h + gap + appt_h_raw + notif_block_h;
     let start_y = if total_h <= area.height {
         area.y + (area.height - total_h) / 2
     } else {
@@ -176,7 +216,21 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         clock,
     );
 
-    let appt_y = clock.bottom() + gap;
+    let mut next_y = clock.bottom() + gap;
+    if tasks_h_raw > 0 {
+        if next_y < area.bottom() {
+            let tasks_h = tasks_h_raw.min(area.bottom() - next_y);
+            let tasks_box = Rect::new(box_x, next_y, box_w, tasks_h);
+            f.render_widget(Clear, tasks_box);
+            f.render_widget(
+                Paragraph::new(task_lines).block(Block::bordered().title(" ACTIVE TASKS ".bold())),
+                tasks_box,
+            );
+            next_y = tasks_box.bottom() + gap;
+        }
+    }
+
+    let appt_y = next_y;
     if appt_y >= area.bottom() {
         return;
     }
@@ -199,6 +253,9 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         appt_box,
     );
 
+    if notif_h_raw == 0 {
+        return;
+    }
     let notif_y = appt_box.bottom() + gap;
     if notif_y >= area.bottom() {
         return;
