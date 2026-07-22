@@ -15,6 +15,15 @@ pub async fn put_calendar(
     let now = time::now_iso();
     let mut tx = state.pool.begin().await?;
 
+    // Full-replace-per-range: the client always pushes its complete window,
+    // so anything in-range not in this payload was deleted upstream — clear
+    // it out first instead of leaving stale rows from a prior push.
+    sqlx::query("DELETE FROM calendar_events WHERE start_at >= ?1 AND start_at < ?2")
+        .bind(&body.range_start)
+        .bind(&body.range_end)
+        .execute(&mut *tx)
+        .await?;
+
     for ev in &body.events {
         sqlx::query(
             "INSERT INTO calendar_events (external_id, title, start_at, end_at, place, is_cancelled, received_at) \

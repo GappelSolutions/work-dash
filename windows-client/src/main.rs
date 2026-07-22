@@ -114,10 +114,11 @@ fn sync_calendar_once(
     calendar_client: &CalendarClient,
     days_past: i64,
     days_future: i64,
-) -> Result<Vec<CalendarEventIn>, String> {
+) -> Result<(String, String, Vec<CalendarEventIn>), String> {
     let (start, end) = calendar_view_range(Utc::now(), days_past, days_future);
     let graph_events = calendar_client.fetch_calendar_view(&start, &end)?;
-    Ok(graph_events.iter().map(map_graph_event).collect())
+    let events = graph_events.iter().map(map_graph_event).collect();
+    Ok((start, end, events))
 }
 
 fn run_calendar_loop(
@@ -130,10 +131,12 @@ fn run_calendar_loop(
     let mut last: Vec<CalendarEventIn> = Vec::new();
     loop {
         match sync_calendar_once(&calendar_client, days_past, days_future) {
-            Ok(events) => {
+            Ok((range_start, range_end, events)) => {
                 if work_dash_windows_client::diff::has_changed(&last, &events) {
                     let body = CalendarPutBody {
                         events: events.clone(),
+                        range_start,
+                        range_end,
                     };
                     match push_client.put_calendar(&body) {
                         Ok(()) => {

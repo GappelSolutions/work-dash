@@ -19,6 +19,8 @@ pub struct CalendarEventIn {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CalendarPutBody {
     pub events: Vec<CalendarEventIn>,
+    pub range_start: String,
+    pub range_end: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

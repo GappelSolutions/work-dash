@@ -270,7 +270,9 @@ async fn calendar_put_upsert_is_idempotent_on_external_id() {
             "start": "2026-07-05T09:15:00+02:00",
             "end": "2026-07-05T09:30:00+02:00",
             "place": "Teams"
-        }]
+        }],
+        "range_start": "2026-07-04T00:00:00Z",
+        "range_end": "2026-07-06T00:00:00Z"
     });
 
     for _ in 0..2 {
@@ -291,6 +293,55 @@ async fn calendar_put_upsert_is_idempotent_on_external_id() {
     let arr = list.as_array().unwrap();
     assert_eq!(arr.len(), 1, "PUTting the same external_id twice must not duplicate rows");
     assert_eq!(arr[0]["title"], "Standup");
+}
+
+#[tokio::test]
+async fn calendar_put_deletes_rows_dropped_from_the_pushed_range() {
+    let (app, _dir) = test_router().await;
+
+    let first_push = serde_json::json!({
+        "events": [{
+            "external_id": "graph-ev-1",
+            "title": "Standup",
+            "start": "2026-07-05T09:15:00+02:00",
+            "end": "2026-07-05T09:30:00+02:00",
+            "place": "Teams"
+        }],
+        "range_start": "2026-07-04T00:00:00Z",
+        "range_end": "2026-07-06T00:00:00Z"
+    });
+    let resp = app
+        .clone()
+        .oneshot(auth_req("PUT", "/api/calendar", Some(first_push)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Second push over the same range with the meeting fully deleted upstream —
+    // the client sends an empty (or smaller) event list, not a cancelled flag.
+    let second_push = serde_json::json!({
+        "events": [],
+        "range_start": "2026-07-04T00:00:00Z",
+        "range_end": "2026-07-06T00:00:00Z"
+    });
+    let resp = app
+        .clone()
+        .oneshot(auth_req("PUT", "/api/calendar", Some(second_push)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let list = body_json(
+        app.oneshot(auth_req("GET", "/api/calendar?date=2026-07-05", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        list.as_array().unwrap().len(),
+        0,
+        "row dropped from the pushed range must be deleted, not left stale"
+    );
 }
 
 #[tokio::test]
