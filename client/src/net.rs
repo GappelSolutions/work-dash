@@ -31,17 +31,22 @@ pub struct ServerCalendarEvent {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ServerTeamsEvent {
-    pub kind: String,
-    pub text: String,
-    pub created_at: String,
+pub struct UnreadCount {
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerCallState {
+    pub active: bool,
+    pub caller: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub tasks: Vec<ServerTask>,
     pub calendar: Vec<ServerCalendarEvent>,
-    pub teams: Vec<ServerTeamsEvent>,
+    pub unread_count: i64,
+    pub call: ServerCallState,
 }
 
 /// Everything the network thread can hand back to the render loop.
@@ -53,7 +58,8 @@ pub enum NetEvent {
     TaskUpserted(ServerTask),
     TaskDeleted { id: i64 },
     CalendarUpdated { events: Vec<ServerCalendarEvent> },
-    TeamsEvent(ServerTeamsEvent),
+    UnreadCount(i64),
+    CallState { active: bool, caller: Option<String> },
 }
 
 #[derive(Clone)]
@@ -102,6 +108,21 @@ pub fn patch_task_phase(config: &NetConfig, task_id: i64, phase: &str) {
     });
 }
 
+/// Dismisses the call banner server-side — fire-and-forget, same rationale
+/// as `patch_task_phase`. The SSE `call_state` event (or the next reconnect
+/// snapshot) is what actually clears other listeners' view of it; this call
+/// just tells the server "gone".
+pub fn dismiss_call(config: &NetConfig) {
+    let config = config.clone();
+    thread::spawn(move || {
+        let client = reqwest::blocking::Client::new();
+        let _ = client
+            .delete(format!("{}/api/call", config.server_url))
+            .bearer_auth(&config.api_key)
+            .send();
+    });
+}
+
 fn run_once(config: &NetConfig, tx: &Sender<NetEvent>) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::blocking::Client::new();
     let today = chrono::Local::now().date_naive();
@@ -123,8 +144,15 @@ fn run_once(config: &NetConfig, tx: &Sender<NetEvent>) -> Result<(), Box<dyn std
         .error_for_status()?
         .json()?;
 
-    let teams: Vec<ServerTeamsEvent> = client
-        .get(format!("{}/api/teams?limit=10", config.server_url))
+    let unread: UnreadCount = client
+        .get(format!("{}/api/teams", config.server_url))
+        .bearer_auth(&config.api_key)
+        .send()?
+        .error_for_status()?
+        .json()?;
+
+    let call: ServerCallState = client
+        .get(format!("{}/api/call", config.server_url))
         .bearer_auth(&config.api_key)
         .send()?
         .error_for_status()?
@@ -134,7 +162,8 @@ fn run_once(config: &NetConfig, tx: &Sender<NetEvent>) -> Result<(), Box<dyn std
     let _ = tx.send(NetEvent::Snapshot(Snapshot {
         tasks,
         calendar,
-        teams,
+        unread_count: unread.count,
+        call,
     }));
 
     let resp = client
@@ -193,9 +222,22 @@ fn dispatch_sse(event_name: &str, data: &str, tx: &Sender<NetEvent>) {
                 }
             }
         }
-        "teams_event" => {
-            if let Ok(ev) = serde_json::from_str::<ServerTeamsEvent>(data) {
-                let _ = tx.send(NetEvent::TeamsEvent(ev));
+        "unread_count" => {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                if let Some(count) = v.get("count").and_then(|c| c.as_i64()) {
+                    let _ = tx.send(NetEvent::UnreadCount(count));
+                }
+            }
+        }
+        "call_state" => {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                if let Some(active) = v.get("active").and_then(|a| a.as_bool()) {
+                    let caller = v
+                        .get("caller")
+                        .and_then(|c| c.as_str())
+                        .map(str::to_string);
+                    let _ = tx.send(NetEvent::CallState { active, caller });
+                }
             }
         }
         // "hello" and "ping" carry no state the app needs to act on.

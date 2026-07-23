@@ -1,7 +1,7 @@
 pub mod break_screen;
 pub mod calendar;
+pub mod call_screen;
 pub mod clock;
-pub mod history;
 pub mod idle;
 pub mod kanban;
 pub mod menu;
@@ -24,6 +24,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.aquarium.ensure_size(area.width, area.height);
     f.render_widget(&app.aquarium, area);
 
+    // Incoming call trumps everything, including an in-progress break.
+    if app.call_active.is_some() {
+        call_screen::draw(f, app, area);
+        return;
+    }
+
     // Break alarm trumps every page.
     if app.break_active {
         break_screen::draw(f, app, area);
@@ -39,7 +45,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Page::Clock => clock::draw(f, app, area),
         Page::Calendar => calendar::draw(f, app, area),
         Page::Kanban => kanban::draw(f, app, area),
-        Page::History => history::draw(f, app, area),
         Page::Idle => unreachable!(),
     }
 

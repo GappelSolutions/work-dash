@@ -75,6 +75,12 @@ fn on_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Incoming call: any key dismisses it, and trumps the break overlay.
+    if app.call_active.is_some() {
+        app.dismiss_call();
+        return;
+    }
+
     // Break overlay: any key dismisses it.
     if app.break_active {
         app.break_active = false;
@@ -97,7 +103,6 @@ fn on_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('1') => app.goto(Page::Clock),
             KeyCode::Char('2') => app.goto(Page::Kanban),
             KeyCode::Char('3') => app.goto(Page::Calendar),
-            KeyCode::Char('4') => app.goto(Page::History),
             KeyCode::Char('q') => app.should_quit = true,
             _ => {}
         }
@@ -111,7 +116,6 @@ fn on_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('1') => app.goto(Page::Clock),
         KeyCode::Char('2') => app.goto(Page::Kanban),
         KeyCode::Char('3') => app.goto(Page::Calendar),
-        KeyCode::Char('4') => app.goto(Page::History),
         _ => on_page_key(app, key.code),
     }
 }
@@ -123,6 +127,12 @@ fn on_mouse(app: &mut App, m: MouseEvent, area: Rect) {
         return;
     }
     let pos = Position::new(m.column, m.row);
+
+    // Incoming call: click anywhere dismisses it, and trumps the break overlay.
+    if app.call_active.is_some() {
+        app.dismiss_call();
+        return;
+    }
 
     // Break overlay: click anywhere dismisses it.
     if app.break_active {

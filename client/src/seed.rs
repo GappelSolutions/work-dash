@@ -4,7 +4,7 @@
 
 use chrono::{Duration, Local};
 
-use crate::app::{CalendarEvent, Card, Column, NotifKind, Notification, Phase};
+use crate::app::{CalendarEvent, Card, Column, Phase};
 
 pub fn calendar_events() -> Vec<CalendarEvent> {
     let today = Local::now().date_naive();
@@ -29,19 +29,8 @@ pub fn calendar_events() -> Vec<CalendarEvent> {
     ]
 }
 
-pub fn notifications() -> Vec<Notification> {
-    let now = Local::now();
-    let n = |mins_ago: i64, kind, text: &str| Notification {
-        time: now - Duration::minutes(mins_ago),
-        kind,
-        text: text.to_string(),
-    };
-    vec![
-        n(4, NotifKind::Call, "Incoming Teams call: John Doe"),
-        n(28, NotifKind::Reminder, "Sprint review in 1 hour"),
-        n(61, NotifKind::Break, "Break alarm — dismissed"),
-        n(95, NotifKind::Info, "Laptop connected"),
-    ]
+pub fn unread_count() -> u32 {
+    3
 }
 
 /// Hourly break alarm — hardcoded interval for now (see ARCHITECTURE.md).

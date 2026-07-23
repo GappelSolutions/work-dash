@@ -9,36 +9,53 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, CalendarEvent, NotifKind, Phase};
+use crate::app::{App, CalendarEvent, Phase};
 use crate::bigtext;
 
-/// One appointment row: title left (green + marker if in progress, else
-/// yellow), room dim gray and time white, right-aligned.
-fn appt_line(ev: &CalendarEvent, box_w: u16, active: bool) -> Line<'static> {
+/// One appointment as a 2x2 block: title top-left, location bottom-left,
+/// start time top-right ("FROM"), end time bottom-right ("UNTIL").
+fn appt_lines(ev: &CalendarEvent, box_w: u16, active: bool) -> Vec<Line<'static>> {
     let title_style = if active {
         Style::default().fg(Color::Green).bold()
     } else {
         Style::default().fg(Color::Yellow)
     };
-    let left = if active {
+    let title_left = if active {
         format!("\u{25b8} {}", ev.title)
     } else {
         ev.title.clone()
     };
-    let time = ev.start.format("%H:%M").to_string();
-    let right_len = ev.place.as_ref().map_or(0, |p| p.chars().count() + 2) + time.chars().count();
-    let inner_w = box_w.saturating_sub(2) as usize;
-    let gap_w = inner_w
-        .saturating_sub(left.chars().count())
-        .saturating_sub(right_len)
-        .max(1);
+    let place_left = ev.place.clone().unwrap_or_default();
+    let from_right = ev.start.format("%H:%M").to_string();
+    let until_right = ev.end.format("%H:%M").to_string();
 
-    let mut spans = vec![Span::styled(left, title_style), Span::raw(" ".repeat(gap_w))];
-    if let Some(place) = &ev.place {
-        spans.push(Span::styled(format!("{place}  "), Style::default().fg(Color::DarkGray)));
-    }
-    spans.push(Span::styled(time, Style::default().fg(Color::White)));
-    Line::from(spans)
+    let inner_w = box_w.saturating_sub(2) as usize;
+    let row = |left: String, left_style: Style, right: String, right_style: Style| {
+        let gap_w = inner_w
+            .saturating_sub(left.chars().count())
+            .saturating_sub(right.chars().count())
+            .max(1);
+        Line::from(vec![
+            Span::styled(left, left_style),
+            Span::raw(" ".repeat(gap_w)),
+            Span::styled(right, right_style),
+        ])
+    };
+
+    vec![
+        row(
+            title_left,
+            title_style,
+            from_right,
+            Style::default().fg(Color::White),
+        ),
+        row(
+            place_left,
+            Style::default().fg(Color::DarkGray),
+            until_right,
+            Style::default().fg(Color::White),
+        ),
+    ]
 }
 
 /// Width of the clock column's floating windows. Shared so other pages
@@ -132,28 +149,18 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             upcoming.get(1).map(|&i| (i, false)),
         )
     };
-    let appt_h_raw = 4;
+    let appt_h_raw = 6;
 
-    // Notifications list — latest 3, newest on top, sized to content.
-    let mut items: Vec<Line> = Vec::new();
-    for n in app.notifications.iter().take(3) {
-        let (tag, style) = match n.kind {
-            NotifKind::Call => ("[CALL]", Style::default().fg(Color::Red).bold()),
-            NotifKind::Reminder => ("[REM ]", Style::default().fg(Color::Yellow)),
-            NotifKind::Break => ("[BRK ]", Style::default().fg(Color::Magenta)),
-            NotifKind::Info => ("[INFO]", Style::default().fg(Color::DarkGray)),
-        };
-        items.push(Line::from(vec![
-            Span::styled(
-                format!(" {} ", n.time.format("%H:%M")),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(tag, style),
-            Span::raw("  "),
-            Span::raw(n.text.clone()),
-        ]));
-    }
-    let notif_h_raw = if items.is_empty() { 0 } else { items.len() as u16 + 2 };
+    // Unread-messages count — a single persisted number, nothing more.
+    let notif_line = if app.unread_count == 0 {
+        Line::from("no unread messages".dark_gray())
+    } else {
+        Line::from(vec![Span::styled(
+            format!("{} unread messages", app.unread_count),
+            Style::default().fg(Color::Yellow).bold(),
+        )])
+    };
+    let notif_h_raw = 3u16;
 
     // Active (WIP) tasks across all kanban columns — hidden entirely when none.
     let task_lines: Vec<Line> = app
@@ -238,24 +245,26 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let appt_box = Rect::new(box_x, appt_y, box_w, appt_h);
     f.render_widget(Clear, appt_box);
 
-    let appt_lines: Vec<Line> = vec![
-        match appt_row1 {
-            Some((i, active)) => appt_line(&app.events[i], box_w, active),
-            None => Line::from("no more appointments today".dark_gray()),
-        },
-        match appt_row2 {
-            Some((i, active)) => appt_line(&app.events[i], box_w, active),
-            None => Line::default(),
-        },
-    ];
+    let mut appt_block_lines: Vec<Line> = Vec::new();
+    match appt_row1 {
+        Some((i, active)) => appt_block_lines.extend(appt_lines(&app.events[i], box_w, active)),
+        None => {
+            appt_block_lines.push(Line::from("no more appointments today".dark_gray()));
+            appt_block_lines.push(Line::default());
+        }
+    }
+    match appt_row2 {
+        Some((i, active)) => appt_block_lines.extend(appt_lines(&app.events[i], box_w, active)),
+        None => {
+            appt_block_lines.push(Line::default());
+            appt_block_lines.push(Line::default());
+        }
+    }
     f.render_widget(
-        Paragraph::new(appt_lines).block(Block::bordered().title(" APPOINTMENTS ".bold())),
+        Paragraph::new(appt_block_lines).block(Block::bordered().title(" APPOINTMENTS ".bold())),
         appt_box,
     );
 
-    if notif_h_raw == 0 {
-        return;
-    }
     let notif_y = appt_box.bottom() + gap;
     if notif_y >= area.bottom() {
         return;
@@ -264,7 +273,9 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let notif = Rect::new(box_x, notif_y, box_w, notif_h);
     f.render_widget(Clear, notif);
     f.render_widget(
-        Paragraph::new(items).block(Block::bordered().title(" NOTIFICATIONS ".bold())),
+        Paragraph::new(notif_line)
+            .centered()
+            .block(Block::bordered().title(" NOTIFICATIONS ".bold())),
         notif,
     );
 }

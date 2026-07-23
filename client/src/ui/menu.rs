@@ -7,11 +7,10 @@ use ratatui::Frame;
 
 use crate::app::{App, Page};
 
-pub const ENTRIES: [(Page, &str); 4] = [
+pub const ENTRIES: [(Page, &str); 3] = [
     (Page::Clock, "1  CLOCK"),
     (Page::Kanban, "2  KANBAN"),
     (Page::Calendar, "3  CALENDAR"),
-    (Page::History, "4  NOTIFICATIONS"),
 ];
 
 /// Popup rect + the four button cells (same order as ENTRIES).

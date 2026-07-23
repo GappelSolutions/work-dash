@@ -13,26 +13,8 @@ pub enum Page {
     Clock,
     Calendar,
     Kanban,
-    /// Notification history: newest on top, capped at 10.
-    History,
     /// Leave / laptop-disconnected view: clock + aquarium only.
     Idle,
-}
-
-/// Most-recent-first cap for the notification history.
-pub const MAX_NOTIFICATIONS: usize = 10;
-
-pub enum NotifKind {
-    Call,
-    Reminder,
-    Break,
-    Info,
-}
-
-pub struct Notification {
-    pub time: DateTime<Local>,
-    pub kind: NotifKind,
-    pub text: String,
 }
 
 pub struct CalendarEvent {
@@ -96,10 +78,15 @@ pub struct App {
     pub next_break: DateTime<Local>,
     /// Set when a break alarm fires; drives the fullscreen break overlay.
     pub break_active: bool,
+    /// Incoming-call banner: `Some(caller)` while a call is ringing.
+    /// Ephemeral — mirrors the server's in-memory singleton, never a log
+    /// entry. Trumps `break_active` (see `ui::draw`).
+    pub call_active: Option<String>,
     /// Free-running tick counter, used to strobe the break overlay.
     pub flash: u32,
     pub events: Vec<CalendarEvent>,
-    pub notifications: Vec<Notification>,
+    /// Persisted server-side; a single unread-messages count, nothing more.
+    pub unread_count: u32,
     pub columns: Vec<Column>,
     /// `Some` when `WORK_DASH_SERVER_URL`/`WORK_DASH_API_KEY` were set at
     /// startup — used to PATCH phase changes back. `None` means fully
@@ -128,17 +115,14 @@ impl App {
             aquarium: AquariumField::new(0, 0),
             next_break: seed::next_break(),
             break_active: false,
+            call_active: None,
             flash: 0,
             events: if networked {
                 Vec::new()
             } else {
                 seed::calendar_events()
             },
-            notifications: if networked {
-                Vec::new()
-            } else {
-                seed::notifications()
-            },
+            unread_count: if networked { 0 } else { seed::unread_count() },
             columns: if networked { empty_columns() } else { seed::kanban() },
             net_config,
             connected: false,
@@ -178,12 +162,12 @@ impl App {
                     .into_iter()
                     .filter_map(calendar_event_from_server)
                     .collect();
-                self.notifications = snap
-                    .teams
-                    .into_iter()
-                    .filter_map(notification_from_server)
-                    .collect();
-                self.notifications.truncate(MAX_NOTIFICATIONS);
+                self.unread_count = snap.unread_count.max(0) as u32;
+                self.call_active = if snap.call.active {
+                    Some(snap.call.caller.unwrap_or_else(|| "Unknown caller".to_string()))
+                } else {
+                    None
+                };
             }
             NetEvent::TaskUpserted(task) => self.upsert_task(task),
             NetEvent::TaskDeleted { id } => self.remove_task(id),
@@ -193,12 +177,27 @@ impl App {
                     .filter_map(calendar_event_from_server)
                     .collect();
             }
-            NetEvent::TeamsEvent(ev) => {
-                if let Some(n) = notification_from_server(ev) {
-                    self.notifications.insert(0, n);
-                    self.notifications.truncate(MAX_NOTIFICATIONS);
-                }
+            NetEvent::UnreadCount(count) => {
+                self.unread_count = count.max(0) as u32;
             }
+            NetEvent::CallState { active, caller } => {
+                self.call_active = if active {
+                    Some(caller.unwrap_or_else(|| "Unknown caller".to_string()))
+                } else {
+                    None
+                };
+            }
+        }
+    }
+
+    /// Dismisses the incoming-call banner: clears it locally and, when
+    /// networked, tells the server so the flag is actually deleted (not
+    /// just hidden on this one board) — other SSE listeners need to see it
+    /// go away too.
+    pub fn dismiss_call(&mut self) {
+        self.call_active = None;
+        if let Some(cfg) = &self.net_config {
+            net::dismiss_call(cfg);
         }
     }
 
@@ -225,21 +224,6 @@ impl App {
                 id: Some(task.id),
             });
         }
-    }
-
-    /// Record a notification: newest on top, history capped at `MAX_NOTIFICATIONS`.
-    /// Wired to the laptop push channel later; seeded for now.
-    #[allow(dead_code)]
-    pub fn notify(&mut self, kind: NotifKind, text: impl Into<String>) {
-        self.notifications.insert(
-            0,
-            Notification {
-                time: Local::now(),
-                kind,
-                text: text.into(),
-            },
-        );
-        self.notifications.truncate(MAX_NOTIFICATIONS);
     }
 
     /// Advance a card's phase (untouched -> wip -> done -> untouched).
@@ -304,22 +288,5 @@ fn calendar_event_from_server(e: net::ServerCalendarEvent) -> Option<CalendarEve
         end,
         title: e.title,
         place: e.place,
-    })
-}
-
-fn notification_from_server(e: net::ServerTeamsEvent) -> Option<Notification> {
-    let kind = match e.kind.as_str() {
-        "call" => NotifKind::Call,
-        "reminder" => NotifKind::Reminder,
-        "info" => NotifKind::Info,
-        _ => return None,
-    };
-    let time = DateTime::parse_from_rfc3339(&e.created_at)
-        .map(|t| t.with_timezone(&Local))
-        .unwrap_or_else(|_| Local::now());
-    Some(Notification {
-        time,
-        kind,
-        text: e.text,
     })
 }

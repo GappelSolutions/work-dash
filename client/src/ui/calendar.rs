@@ -7,9 +7,30 @@ use ratatui::Frame;
 
 use crate::app::App;
 
+fn pad_two_col<'a>(
+    left: &str,
+    right: &str,
+    left_style: Style,
+    right_style: Style,
+    width: usize,
+) -> Line<'a> {
+    let gap = width
+        .saturating_sub(left.chars().count())
+        .saturating_sub(right.chars().count())
+        .max(1);
+    Line::from(vec![
+        Span::styled(left.to_string(), left_style),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(right.to_string(), right_style),
+    ])
+}
+
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let now = Local::now();
     let next_idx = app.events.iter().position(|e| e.start > now);
+
+    let w = 72.min(area.width);
+    let inner_w = w.saturating_sub(2) as usize;
 
     let mut lines: Vec<Line> = vec![Line::default()];
     for (i, ev) in app.events.iter().enumerate() {
@@ -24,21 +45,20 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             (" ", Style::default())
         };
 
-        let mut spans = vec![
-            Span::styled(format!(" {marker} "), style),
-            Span::styled(
-                format!("{}–{}", ev.start.format("%H:%M"), ev.end.format("%H:%M")),
-                style,
-            ),
-            Span::styled(format!("  {}", ev.title), style),
-        ];
-        if let Some(place) = &ev.place {
-            spans.push(Span::styled(
-                format!("  ({place})"),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        lines.push(Line::from(spans));
+        let left_top = format!(" {marker} {}", ev.title);
+        let right_top = format!("FROM {}", ev.start.format("%H:%M"));
+        lines.push(pad_two_col(&left_top, &right_top, style, style, inner_w));
+
+        let left_bot = format!("   {}", ev.place.as_deref().unwrap_or(""));
+        let right_bot = format!("UNTIL {}", ev.end.format("%H:%M"));
+        lines.push(pad_two_col(
+            &left_bot,
+            &right_bot,
+            Style::default().fg(Color::DarkGray),
+            style,
+            inner_w,
+        ));
+
         lines.push(Line::default());
     }
 
@@ -63,7 +83,6 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let title = format!(" CALENDAR — {} ", now.format("%A, %d %B"));
 
     // Floating window sized to content; aquarium stays visible around it.
-    let w = 72.min(area.width);
     let next_h = 3u16;
     let h = (lines.len() as u16 + 3).min(area.height.saturating_sub(next_h));
     let total_h = (h + next_h).min(area.height);
