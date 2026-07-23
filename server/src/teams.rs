@@ -1,75 +1,45 @@
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
-use serde::Deserialize;
 
 use crate::error::AppResult;
 use crate::events::ServerEvent;
-use crate::models::{TeamsEvent, TeamsEventIn, TeamsEventRow};
+use crate::models::{SetUnreadCount, UnreadCount};
 use crate::state::AppState;
-use crate::time;
 
+/// Sets (not increments) the persisted unread-messages count. The
+/// windows-client polls Graph (`/me/chats?$expand=lastMessagePreview,
+/// viewpoint`) and diffs against Teams' own "last read" state, so it always
+/// pushes the current absolute total — this self-corrects every poll
+/// instead of drifting, and needs no "mark read" trigger anywhere in this
+/// read-only kiosk system.
 pub async fn put_teams(
     State(state): State<AppState>,
-    Json(input): Json<TeamsEventIn>,
-) -> AppResult<(StatusCode, Json<TeamsEvent>)> {
-    let event = insert_teams_event(&state, input).await?;
-    Ok((StatusCode::CREATED, Json(event)))
+    Json(body): Json<SetUnreadCount>,
+) -> AppResult<(StatusCode, Json<UnreadCount>)> {
+    let count = set_unread_count(&state, body.count).await?;
+    Ok((StatusCode::CREATED, Json(UnreadCount { count })))
 }
 
-/// Shared by the `/api/teams` PUT handler and the Graph webhook
-/// (`graph_webhook::receive_notifications`) so both ingest paths insert,
-/// publish, and shape the response the same way.
-pub async fn insert_teams_event(state: &AppState, input: TeamsEventIn) -> AppResult<TeamsEvent> {
-    let now = time::now_iso();
-    let payload_json = input.payload.as_ref().map(|p| p.to_string());
-
-    let id = sqlx::query(
-        "INSERT INTO teams_events (kind, text, payload, created_at) VALUES (?,?,?,?)",
-    )
-    .bind(input.kind.as_str())
-    .bind(&input.text)
-    .bind(&payload_json)
-    .bind(&now)
-    .execute(&state.pool)
-    .await?
-    .last_insert_rowid();
-
-    let row: TeamsEventRow = sqlx::query_as(
-        "SELECT id, kind, text, payload, created_at FROM teams_events WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_one(&state.pool)
-    .await?;
-
-    let event: TeamsEvent = row.into();
-    state
-        .bus
-        .publish(ServerEvent::TeamsEventFired(event.clone()));
-    Ok(event)
+pub async fn set_unread_count(state: &AppState, count: i64) -> AppResult<i64> {
+    sqlx::query("UPDATE unread_count SET count = ? WHERE id = 1")
+        .bind(count)
+        .execute(&state.pool)
+        .await?;
+    state.bus.publish(ServerEvent::UnreadCountChanged { count });
+    Ok(count)
 }
 
-#[derive(Debug, Deserialize)]
-pub struct TeamsQuery {
-    limit: Option<i64>,
-}
-
-pub async fn get_teams(
-    State(state): State<AppState>,
-    Query(q): Query<TeamsQuery>,
-) -> AppResult<Json<Vec<TeamsEvent>>> {
-    let limit = q.limit.unwrap_or(10).clamp(1, 100);
-    Ok(Json(fetch_recent_teams(&state.pool, limit).await?))
+pub async fn get_teams(State(state): State<AppState>) -> AppResult<Json<UnreadCount>> {
+    Ok(Json(UnreadCount {
+        count: get_unread_count(&state.pool).await?,
+    }))
 }
 
 /// Shared by the JSON API and the CMS info strip.
-pub async fn fetch_recent_teams(pool: &sqlx::SqlitePool, limit: i64) -> AppResult<Vec<TeamsEvent>> {
-    let rows: Vec<TeamsEventRow> = sqlx::query_as(
-        "SELECT id, kind, text, payload, created_at FROM teams_events \
-         ORDER BY created_at DESC LIMIT ?",
-    )
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows.into_iter().map(TeamsEvent::from).collect())
+pub async fn get_unread_count(pool: &sqlx::SqlitePool) -> AppResult<i64> {
+    let count: i64 = sqlx::query_scalar("SELECT count FROM unread_count WHERE id = 1")
+        .fetch_one(pool)
+        .await?;
+    Ok(count)
 }

@@ -182,66 +182,27 @@ pub struct CalendarPutBody {
     pub range_end: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TeamsKind {
-    Call,
-    Reminder,
-    Info,
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct UnreadCount {
+    pub count: i64,
 }
 
-impl TeamsKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TeamsKind::Call => "call",
-            TeamsKind::Reminder => "reminder",
-            TeamsKind::Info => "info",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<TeamsKind> {
-        match s {
-            "call" => Some(TeamsKind::Call),
-            "reminder" => Some(TeamsKind::Reminder),
-            "info" => Some(TeamsKind::Info),
-            _ => None,
-        }
-    }
+/// Body for `PUT /api/teams` — the windows-client polls Graph and pushes the
+/// current absolute unread total (poll-and-diff), never a delta.
+#[derive(Debug, Deserialize)]
+pub struct SetUnreadCount {
+    pub count: i64,
 }
 
-#[derive(Debug, sqlx::FromRow)]
-pub struct TeamsEventRow {
-    pub id: i64,
-    pub kind: String,
-    pub text: String,
-    pub payload: Option<String>,
-    pub created_at: String,
+/// Body for `PUT /api/call` — caller name only, nothing persisted past the
+/// in-memory singleton (see `AppState::call_state`).
+#[derive(Debug, Deserialize)]
+pub struct PutCallBody {
+    pub caller: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct TeamsEvent {
-    pub id: i64,
-    pub kind: TeamsKind,
-    pub text: String,
-    pub payload: Option<serde_json::Value>,
-    pub created_at: String,
-}
-
-impl From<TeamsEventRow> for TeamsEvent {
-    fn from(r: TeamsEventRow) -> Self {
-        TeamsEvent {
-            id: r.id,
-            kind: TeamsKind::parse(&r.kind).expect("kind CHECK constraint"),
-            text: r.text,
-            payload: r.payload.and_then(|p| serde_json::from_str(&p).ok()),
-            created_at: r.created_at,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct TeamsEventIn {
-    pub kind: TeamsKind,
-    pub text: String,
-    pub payload: Option<serde_json::Value>,
+pub struct CallStatus {
+    pub active: bool,
+    pub caller: Option<String>,
 }

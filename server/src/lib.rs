@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod calendar;
+pub mod call;
 pub mod cms;
 pub mod db;
 pub mod error;
@@ -48,6 +49,10 @@ pub fn build_router(state: AppState) -> Router {
             get(calendar::get_calendar).put(calendar::put_calendar),
         )
         .route("/teams", get(teams::get_teams).put(teams::put_teams))
+        .route(
+            "/call",
+            get(call::get_call).put(call::put_call).delete(call::clear_call),
+        )
         .route("/events", get(sse::sse_handler))
         .route(
             "/graph/notifications",
@@ -107,6 +112,8 @@ pub async fn run() -> anyhow::Result<()> {
         session_password: Arc::new(session_password),
         cookie_key: derive_cookie_key(&session_secret),
         graph_webhook_client_state,
+        call_state: Arc::new(std::sync::Mutex::new(None)),
+        call_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
 
     let app = build_router(state);

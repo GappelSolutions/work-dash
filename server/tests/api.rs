@@ -1,5 +1,6 @@
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
@@ -30,6 +31,8 @@ async fn test_router() -> (Router, tempfile::TempDir) {
         session_password: Arc::new(PASSWORD.to_string()),
         cookie_key: work_dash_server::derive_cookie_key("test-secret"),
         graph_webhook_client_state: None,
+        call_state: Arc::new(Mutex::new(None)),
+        call_seq: Arc::new(AtomicU64::new(0)),
     };
 
     (work_dash_server::build_router(state), dir)
@@ -345,29 +348,90 @@ async fn calendar_put_deletes_rows_dropped_from_the_pushed_range() {
 }
 
 #[tokio::test]
-async fn teams_put_creates_event_and_get_respects_limit_and_order() {
+async fn teams_put_sets_absolute_unread_count() {
     let (app, _dir) = test_router().await;
 
-    for i in 0..3 {
-        let resp = app
-            .clone()
-            .oneshot(auth_req(
-                "PUT",
-                "/api/teams",
-                Some(serde_json::json!({"kind": "info", "text": format!("event {i}")})),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-    }
+    let resp = app
+        .clone()
+        .oneshot(auth_req(
+            "PUT",
+            "/api/teams",
+            Some(serde_json::json!({"count": 5})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
 
-    let list = body_json(
-        app.oneshot(auth_req("GET", "/api/teams?limit=2", None))
+    let got = body_json(
+        app.clone()
+            .oneshot(auth_req("GET", "/api/teams", None))
             .await
             .unwrap(),
     )
     .await;
-    let arr = list.as_array().unwrap();
-    assert_eq!(arr.len(), 2, "limit=2 must cap the result");
-    assert_eq!(arr[0]["text"], "event 2", "newest first");
+    assert_eq!(got["count"], 5);
+
+    // A later poll reporting a lower count (messages got read in Teams
+    // itself) must actually lower it, not just ratchet upward — this is
+    // what distinguishes poll-and-diff from increment-only.
+    let resp2 = app
+        .clone()
+        .oneshot(auth_req(
+            "PUT",
+            "/api/teams",
+            Some(serde_json::json!({"count": 2})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::CREATED);
+
+    let got2 = body_json(
+        app.oneshot(auth_req("GET", "/api/teams", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(got2["count"], 2, "PUT must set the absolute count, not add to it");
+}
+
+#[tokio::test]
+async fn call_put_then_dismiss_clears_it_server_side() {
+    let (app, _dir) = test_router().await;
+
+    let put = app
+        .clone()
+        .oneshot(auth_req(
+            "PUT",
+            "/api/call",
+            Some(serde_json::json!({"caller": "Sarah Lee"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::NO_CONTENT);
+
+    let got = body_json(
+        app.clone()
+            .oneshot(auth_req("GET", "/api/call", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(got["active"], true);
+    assert_eq!(got["caller"], "Sarah Lee");
+
+    let del = app
+        .clone()
+        .oneshot(auth_req("DELETE", "/api/call", None))
+        .await
+        .unwrap();
+    assert_eq!(del.status(), StatusCode::NO_CONTENT);
+
+    let got_after = body_json(
+        app.oneshot(auth_req("GET", "/api/call", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(got_after["active"], false);
+    assert_eq!(got_after["caller"], serde_json::Value::Null);
 }

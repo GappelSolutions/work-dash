@@ -1,7 +1,7 @@
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-use crate::models::{CalendarEvent, Task, TeamsEvent};
+use crate::models::{CalendarEvent, Task};
 
 /// Fan-out channel: every mutating handler sends one of these after its DB
 /// commit; `/api/events` subscribes and maps each into an SSE frame.
@@ -14,8 +14,10 @@ pub enum ServerEvent {
     TaskDeleted { id: i64 },
     #[serde(rename = "calendar_updated")]
     CalendarUpdated { date: String, events: Vec<CalendarEvent> },
-    #[serde(rename = "teams_event")]
-    TeamsEventFired(TeamsEvent),
+    #[serde(rename = "unread_count")]
+    UnreadCountChanged { count: i64 },
+    #[serde(rename = "call_state")]
+    CallStateChanged { active: bool, caller: Option<String> },
 }
 
 impl ServerEvent {
@@ -26,7 +28,8 @@ impl ServerEvent {
             ServerEvent::TaskUpserted { .. } => "task_upserted",
             ServerEvent::TaskDeleted { .. } => "task_deleted",
             ServerEvent::CalendarUpdated { .. } => "calendar_updated",
-            ServerEvent::TeamsEventFired(_) => "teams_event",
+            ServerEvent::UnreadCountChanged { .. } => "unread_count",
+            ServerEvent::CallStateChanged { .. } => "call_state",
         }
     }
 }

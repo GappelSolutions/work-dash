@@ -11,7 +11,7 @@ use crate::icons::icon;
 use crate::models::{Category, CreateTask, PatchTask, Phase, Task};
 use crate::state::AppState;
 use crate::tasks;
-use crate::teams::fetch_recent_teams;
+use crate::teams::get_unread_count;
 use crate::time;
 
 fn redirect_back(date: &str, scope: Option<&str>) -> Redirect {
@@ -50,7 +50,7 @@ pub async fn board_page(
     let board_tasks = tasks::query_tasks(&state.pool, &scope, Some(&date), false).await?;
     let backlog = tasks::query_tasks(&state.pool, "backlog", None, false).await?;
     let calendar_events = fetch_day_events(&state.pool, &date).await?;
-    let teams_events = fetch_recent_teams(&state.pool, 10).await?;
+    let unread_count = get_unread_count(&state.pool).await?;
 
     Ok(render_board(
         &scope,
@@ -60,7 +60,7 @@ pub async fn board_page(
         &board_tasks,
         &backlog,
         &calendar_events,
-        &teams_events,
+        unread_count,
     ))
 }
 
@@ -73,7 +73,7 @@ fn render_board(
     board_tasks: &[Task],
     backlog: &[Task],
     calendar_events: &[crate::models::CalendarEvent],
-    teams_events: &[crate::models::TeamsEvent],
+    unread_count: i64,
 ) -> Markup {
     let prev = shift_date(date, -1);
     let next = shift_date(date, 1);
@@ -158,26 +158,13 @@ fn render_board(
                             }
                         }
                         div class="box" {
-                            h3 { (icon("phone-incoming")) "RECENT TEAMS" span class="ro" { "read-only · live via SSE" } }
-                            @for t in teams_events {
-                                div class="tline" {
-                                    span class="ico" { (icon(teams_kind_icon(t.kind))) }
-                                    (t.text)
-                                }
-                            }
+                            h3 { (icon("phone-incoming")) "TEAMS" span class="ro" { "read-only · live via SSE" } }
+                            div class="tline" { (format!("{unread_count} unread messages")) }
                         }
                     }
                 }
             }
         }
-    }
-}
-
-fn teams_kind_icon(kind: crate::models::TeamsKind) -> &'static str {
-    match kind {
-        crate::models::TeamsKind::Call => "phone-incoming",
-        crate::models::TeamsKind::Reminder => "alarm-clock",
-        crate::models::TeamsKind::Info => "plug",
     }
 }
 

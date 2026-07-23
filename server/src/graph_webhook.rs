@@ -5,20 +5,25 @@
 //! Deliberately does not fetch or decrypt message content — the
 //! subscription is created without `includeResourceData`, so all a
 //! notification carries is "something changed in this chat," which is
-//! enough to forward as a generic notification. Public by necessity (Graph
+//! enough to confirm the subscription is alive. Public by necessity (Graph
 //! calls this with no bearer/cookie auth this server understands); the
 //! shared `clientState` secret set on the subscription is the only guard
 //! against spoofed deliveries, so treat it like a credential (see
 //! `GRAPH_WEBHOOK_CLIENT_STATE` in `README`/deploy config).
+//!
+//! The unread count itself is *not* derived from these deliveries — the
+//! windows-client separately polls Graph and diffs against Teams' own
+//! "last read" state (`graph::chats`, poll-and-diff), which self-corrects
+//! every poll instead of drifting. Counting webhook deliveries here as well
+//! would double-count against that poll, so this handler only validates
+//! and acknowledges.
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
-use crate::models::{TeamsEventIn, TeamsKind};
 use crate::state::AppState;
-use crate::teams::insert_teams_event;
 
 #[derive(Debug, Deserialize)]
 pub struct ValidationQuery {
@@ -37,7 +42,6 @@ struct ChangeNotification {
     subscription_id: String,
     #[serde(rename = "clientState")]
     client_state: Option<String>,
-    resource: Option<String>,
 }
 
 pub async fn receive_notifications(
@@ -74,16 +78,10 @@ pub async fn receive_notifications(
             continue;
         }
 
-        let event = TeamsEventIn {
-            kind: TeamsKind::Info,
-            text: "New Teams chat message".to_string(),
-            payload: notification
-                .resource
-                .map(|r| serde_json::json!({ "resource": r, "source": "graph" })),
-        };
-        if insert_teams_event(&state, event).await.is_err() {
-            tracing::error!("failed to record Graph chat notification");
-        }
+        tracing::debug!(
+            subscription = %notification.subscription_id,
+            "Graph chat notification received (unread count is tracked by the poll-and-diff loop, not this delivery)"
+        );
     }
 
     // Graph requires a 2xx within ~10s or it treats the delivery as failed
@@ -101,7 +99,8 @@ mod tests {
     use axum::routing::post;
     use axum::Router;
     use std::collections::HashSet;
-    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, Mutex};
     use tower::ServiceExt;
 
     /// Fresh isolated SQLite file per test (mirrors `server/tests/api.rs`'s
@@ -122,6 +121,8 @@ mod tests {
             session_password: Arc::new("pw".to_string()),
             cookie_key: axum_extra::extract::cookie::Key::from(&[0u8; 64]),
             graph_webhook_client_state: client_state.map(str::to_string),
+            call_state: Arc::new(Mutex::new(None)),
+            call_seq: Arc::new(AtomicU64::new(0)),
         };
         (state, dir)
     }
@@ -149,9 +150,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matching_client_state_is_recorded() {
+    async fn matching_client_state_is_acknowledged() {
         let (state, _dir) = test_state(Some("secret")).await;
-        let pool = state.pool.clone();
         let body = serde_json::json!({
             "value": [{
                 "subscriptionId": "sub-1",
@@ -169,18 +169,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
-
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM teams_events")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(count, 1);
     }
 
     #[tokio::test]
-    async fn mismatched_client_state_is_ignored() {
+    async fn mismatched_client_state_is_ignored_but_still_acknowledged() {
         let (state, _dir) = test_state(Some("secret")).await;
-        let pool = state.pool.clone();
         let body = serde_json::json!({
             "value": [{
                 "subscriptionId": "sub-1",
@@ -198,12 +191,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
-
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM teams_events")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(count, 0);
     }
 
     #[tokio::test]
