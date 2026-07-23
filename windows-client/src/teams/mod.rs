@@ -2,6 +2,7 @@ pub mod classify;
 pub mod listener_mock;
 pub mod logtail;
 pub mod source;
+pub mod unread;
 
 #[cfg(windows)]
 pub mod listener_win;

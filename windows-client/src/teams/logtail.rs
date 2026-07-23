@@ -85,6 +85,70 @@ fn find_active_log(dir: &Path) -> Option<PathBuf> {
         .map(|e| e.path())
 }
 
+/// Generic new-line tailer over the active `MSTeams_*.log`, shared by
+/// `LogTailCallSource` (ring detection) and `unread::UnreadCountSource`
+/// (unread badge count) — same file, same rotation handling, different
+/// per-line parsing. `on_line` returns `false` to stop the tailer early
+/// (e.g. once its output channel's receiver has been dropped).
+pub(crate) fn spawn_tailer(
+    log_dir: PathBuf,
+    poll: Duration,
+    mut on_line: impl FnMut(&str) -> bool + Send + 'static,
+) {
+    thread::spawn(move || {
+        let mut current_path: Option<PathBuf> = None;
+        let mut offset: u64 = 0;
+
+        loop {
+            let active = find_active_log(&log_dir);
+            match active {
+                Some(path) => {
+                    if current_path.as_deref() != Some(path.as_path()) {
+                        if current_path.is_none() {
+                            // First attach at startup: seek to end so we
+                            // don't replay a whole prior session's history.
+                            offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                        } else {
+                            // Mid-run rotation: Teams closed the old log
+                            // and opened a fresh one. Read the new file
+                            // from the start (offset 0) — it begins empty
+                            // and grows from here, so byte 0 is the start
+                            // of new content, and an event that's the very
+                            // first line written after rotation is caught
+                            // rather than skipped by seeking to end.
+                            offset = 0;
+                        }
+                        current_path = Some(path);
+                    }
+
+                    if let Some(path) = &current_path {
+                        if let Ok(mut file) = std::fs::File::open(path) {
+                            if file.seek(SeekFrom::Start(offset)).is_ok() {
+                                let mut buf = String::new();
+                                if let Ok(n) = file.read_to_string(&mut buf) {
+                                    if n > 0 {
+                                        offset += n as u64;
+                                        for line in buf.lines() {
+                                            if !on_line(line) {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!(dir = %log_dir.display(), "no Teams log file found");
+                }
+            }
+
+            thread::sleep(poll);
+        }
+    });
+}
+
 pub struct LogTailCallSource {
     log_dir: PathBuf,
     poll: Duration,
@@ -102,62 +166,14 @@ impl LogTailCallSource {
 impl CallSource for LogTailCallSource {
     fn start(self) -> Receiver<IncomingCall> {
         let (tx, rx) = mpsc::channel();
-
-        thread::spawn(move || {
-            let mut current_path: Option<PathBuf> = None;
-            let mut offset: u64 = 0;
-
-            loop {
-                let active = find_active_log(&self.log_dir);
-                match active {
-                    Some(path) => {
-                        if current_path.as_deref() != Some(path.as_path()) {
-                            if current_path.is_none() {
-                                // First attach at startup: seek to end so we
-                                // don't replay a whole prior session's calls.
-                                offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                            } else {
-                                // Mid-run rotation: Teams closed the old log
-                                // and opened a fresh one. Read the new file
-                                // from the start (offset 0) — it begins empty
-                                // and grows from here, so byte 0 is the start
-                                // of new content, and a call that's the very
-                                // first line written after rotation is caught
-                                // rather than skipped by seeking to end.
-                                offset = 0;
-                            }
-                            current_path = Some(path);
-                        }
-
-                        if let Some(path) = &current_path {
-                            if let Ok(mut file) = std::fs::File::open(path) {
-                                if file.seek(SeekFrom::Start(offset)).is_ok() {
-                                    let mut buf = String::new();
-                                    if let Ok(n) = file.read_to_string(&mut buf) {
-                                        if n > 0 {
-                                            offset += n as u64;
-                                            for line in buf.lines() {
-                                                if let Some(call) = parse_call_start_line(line) {
-                                                    if tx.send(call).is_err() {
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    None => {
-                        tracing::warn!(dir = %self.log_dir.display(), "no Teams log file found");
-                    }
+        spawn_tailer(self.log_dir, self.poll, move |line| {
+            if let Some(call) = parse_call_start_line(line) {
+                if tx.send(call).is_err() {
+                    return false;
                 }
-
-                thread::sleep(self.poll);
             }
+            true
         });
-
         rx
     }
 }

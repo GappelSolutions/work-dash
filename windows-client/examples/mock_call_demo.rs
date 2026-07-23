@@ -1,10 +1,9 @@
 //! Verification-only: exercises the real `MockCallSource` -> `CallClassifier`
-//! (unused here, mock emits pre-classified calls) -> `WorkDashClient::put_teams`
+//! (unused here, mock emits pre-classified calls) -> `WorkDashClient::put_call`
 //! path without touching Graph auth, so the incoming-call pipeline can be
 //! demoed against a local server. Run with WORK_DASH_SERVER_URL /
 //! WORK_DASH_API_KEY set and MOCK_INCOMING_CALLER for the caller name.
 
-use work_dash_windows_client::models::{TeamsEventIn, TeamsKind};
 use work_dash_windows_client::push::WorkDashClient;
 use work_dash_windows_client::teams::classify::IncomingCall;
 use work_dash_windows_client::teams::listener_mock::MockCallSource;
@@ -24,12 +23,8 @@ fn main() {
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("mock listener did not emit a call");
 
-    let body = TeamsEventIn {
-        kind: TeamsKind::Call,
-        text: format!("Incoming call — {}", call.caller),
-        payload: Some(serde_json::json!({ "caller": call.caller, "source": "toast" })),
-    };
-
-    push_client.put_teams(&body).expect("push to server failed");
-    println!("pushed incoming call for {}", body.text);
+    push_client
+        .put_call(&call.caller)
+        .expect("push to server failed");
+    println!("pushed incoming call for {}", call.caller);
 }

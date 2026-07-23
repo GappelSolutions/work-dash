@@ -10,7 +10,7 @@ use work_dash_windows_client::graph::presence::PresenceClient;
 use work_dash_windows_client::graph::subscriptions::SubscriptionClient;
 use work_dash_windows_client::graph::{auth::GraphAuth, token_cache};
 use work_dash_windows_client::mapping::map_graph_event;
-use work_dash_windows_client::models::{CalendarEventIn, CalendarPutBody, TeamsEventIn, TeamsKind};
+use work_dash_windows_client::models::{CalendarEventIn, CalendarPutBody};
 use work_dash_windows_client::push::WorkDashClient;
 use work_dash_windows_client::teams::classify::{CallClassifier, IncomingCall};
 use work_dash_windows_client::teams::listener_mock::MockCallSource;
@@ -20,6 +20,8 @@ use work_dash_windows_client::teams::listener_win::ToastCallSource;
 use work_dash_windows_client::teams::logtail::{default_log_dir, LogTailCallSource};
 use work_dash_windows_client::teams::source::CallSource;
 #[cfg(windows)]
+use work_dash_windows_client::teams::unread::UnreadCountSource;
+#[cfg(windows)]
 use work_dash_windows_client::teams::window_win::WindowCallSource;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,8 +29,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = Config::from_env()?;
     let push_client = WorkDashClient::new(config.server_url.clone(), config.api_key.clone());
-    let access_token = obtain_access_token(&config)?;
 
+    // Call detection and the unread-count tail are both local-only (window
+    // watcher / log tail) and never touch Graph — they must keep working
+    // even where Microsoft sign-in is unavailable (blocked tenant, no admin
+    // consent, etc.), so both start unconditionally, before any Graph call.
+    start_unread_loop(&push_client);
+
+    // Calendar/presence/chat-subscription are Graph-dependent and therefore
+    // best-effort only: calendar is already covered without Graph by
+    // `outlook_calendar_push.ps1` (Outlook COM automation, no sign-in), so a
+    // failure here just means those three loops don't run — it must not
+    // take down call detection or the unread tail with it.
+    match obtain_access_token(&config) {
+        Ok(access_token) => start_graph_loops(&config, &push_client, access_token),
+        Err(e) => tracing::warn!(
+            %e,
+            "Graph sign-in unavailable — running without it (calendar via \
+             outlook_calendar_push.ps1, unread count via local log tail)"
+        ),
+    }
+
+    let classifier = CallClassifier::default();
+    let calls_rx = start_call_source(&config, classifier);
+    for call in calls_rx {
+        if let Err(e) = push_client.put_call(&call.caller) {
+            tracing::error!(?e, "failed to push incoming call");
+        }
+    }
+
+    Ok(())
+}
+
+fn start_graph_loops(config: &Config, push_client: &WorkDashClient, access_token: String) {
     {
         let calendar_client = CalendarClient::new(access_token.clone());
         let push_client = push_client.clone();
@@ -57,7 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.graph_webhook_public_url.clone(),
         config.graph_webhook_client_state.clone(),
     ) {
-        let subscription_client = SubscriptionClient::new(access_token.clone());
+        let subscription_client = SubscriptionClient::new(access_token);
         thread::spawn(move || {
             run_chat_subscription_loop(subscription_client, public_url, client_state)
         });
@@ -67,43 +100,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
              skipping Graph chat-notification subscription"
         );
     }
-
-    let classifier = CallClassifier::default();
-    let calls_rx = start_call_source(&config, classifier);
-    for call in calls_rx {
-        let body = TeamsEventIn {
-            kind: TeamsKind::Call,
-            text: format!("Incoming call — {}", call.caller),
-            payload: Some(
-                serde_json::json!({ "caller": call.caller, "source": config.teams_call_source }),
-            ),
-        };
-        if let Err(e) = push_client.put_teams(&body) {
-            tracing::error!(?e, "failed to push incoming call");
-        }
-    }
-
-    Ok(())
 }
 
+/// Tails Teams' own local log for its unread-badge marker (see
+/// `teams::unread`) and forwards each change straight to the server — no
+/// Graph, no local read/unread bookkeeping. Windows-only, same as the
+/// `logtail`/`window_win` call sources it shares its tailing machinery with.
+fn start_unread_loop(push_client: &WorkDashClient) {
+    #[cfg(windows)]
+    {
+        let dir = match default_log_dir() {
+            Some(dir) => dir,
+            None => {
+                tracing::error!(
+                    "could not resolve Teams log directory (LOCALAPPDATA unset), \
+                     unread count will not be tracked"
+                );
+                return;
+            }
+        };
+        let push_client = push_client.clone();
+        let rx = UnreadCountSource::new(dir).start();
+        thread::spawn(move || {
+            for count in rx {
+                if let Err(e) = push_client.set_unread_count(count) {
+                    tracing::error!(?e, "failed to push unread count");
+                }
+            }
+        });
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = push_client;
+        tracing::warn!("unread-count log tail is Windows-only; not running on this platform");
+    }
+}
+
+/// Only ever uses a cached refresh token — deliberately does **not** fall
+/// back to interactive device-code sign-in. That flow blocks synchronously
+/// waiting for someone to complete it in a browser, which would hang
+/// `main()` (and with it call detection/unread tracking, neither of which
+/// need Graph at all) on every startup in environments where Microsoft
+/// sign-in isn't available. If you need Graph enabled, run the interactive
+/// login once out-of-band (e.g. via a short-lived helper) so a refresh
+/// token lands in the credential cache; this just consumes it.
 fn obtain_access_token(config: &Config) -> Result<String, String> {
     let auth = GraphAuth::new(config.graph_tenant.clone(), config.graph_client_id.clone());
 
-    if let Some(refresh_token) = token_cache::load_refresh_token() {
-        match auth.refresh_access_token(&refresh_token) {
-            Ok(token) => {
-                if let Some(rt) = &token.refresh_token {
-                    let _ = token_cache::save_refresh_token(rt);
-                }
-                return Ok(token.access_token);
-            }
-            Err(e) => tracing::warn!(%e, "stored refresh token invalid, signing in interactively"),
-        }
-    }
+    let refresh_token = token_cache::load_refresh_token()
+        .ok_or_else(|| "no cached Graph refresh token (interactive sign-in required, not attempted automatically)".to_string())?;
 
-    let device_code = auth.request_device_code()?;
-    println!("{}", device_code.message);
-    let token = auth.poll_for_token(&device_code)?;
+    let token = auth.refresh_access_token(&refresh_token)?;
     if let Some(rt) = &token.refresh_token {
         let _ = token_cache::save_refresh_token(rt);
     }
@@ -165,13 +212,14 @@ fn run_presence_loop(presence_client: PresenceClient, push_client: WorkDashClien
             Ok(presence) => {
                 let in_call = presence.is_in_call();
                 if in_call && !was_in_call {
-                    tracing::info!("presence: entered a call");
-                    let body = TeamsEventIn {
-                        kind: TeamsKind::Call,
-                        text: "In a call (presence)".to_string(),
-                        payload: Some(serde_json::json!({ "source": "presence" })),
-                    };
-                    if let Err(e) = push_client.put_teams(&body) {
+                    // No caller name available from presence alone — this
+                    // only fires as a fallback when the primary ring
+                    // detector (window/logtail/toast) missed the ring
+                    // entirely, so a generic banner beats none. The
+                    // server's ~60s auto-clear timeout takes it back down
+                    // since there's no explicit "call ended" signal here.
+                    tracing::info!("presence: entered a call the primary detector missed");
+                    if let Err(e) = push_client.put_call("Unknown caller (presence)") {
                         tracing::error!(?e, "failed to push presence-detected call");
                     }
                 }

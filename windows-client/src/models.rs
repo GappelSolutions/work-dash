@@ -23,17 +23,16 @@ pub struct CalendarPutBody {
     pub range_end: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TeamsKind {
-    Call,
-    Reminder,
-    Info,
+/// Body for `PUT /api/teams` — the absolute unread count from this poll,
+/// not a delta (see `graph::chats`'s poll-and-diff loop).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct SetUnreadCount {
+    pub count: i64,
 }
 
+/// Body for `PUT /api/call` — caller name only; the server holds this as an
+/// ephemeral singleton, not a log entry.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct TeamsEventIn {
-    pub kind: TeamsKind,
-    pub text: String,
-    pub payload: Option<serde_json::Value>,
+pub struct PutCallBody {
+    pub caller: String,
 }

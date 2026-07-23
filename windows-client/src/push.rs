@@ -1,8 +1,9 @@
-//! Thin HTTP client pushing calendar/teams data to `work-dash-server`.
-//! Mirrors the existing Ratatui client's pattern: blocking `reqwest`,
-//! bearer auth, base URL from config (`client/src/net.rs`).
+//! Thin HTTP client pushing calendar/unread-count/call data to
+//! `work-dash-server`. Mirrors the existing Ratatui client's pattern:
+//! blocking `reqwest`, bearer auth, base URL from config
+//! (`client/src/net.rs`).
 
-use crate::models::{CalendarPutBody, TeamsEventIn};
+use crate::models::{CalendarPutBody, PutCallBody, SetUnreadCount};
 
 #[derive(Debug)]
 pub struct PushError(String);
@@ -47,11 +48,37 @@ impl WorkDashClient {
         Ok(())
     }
 
-    pub fn put_teams(&self, body: &TeamsEventIn) -> Result<(), PushError> {
+    /// Pushes the current absolute unread count from a Graph poll-and-diff
+    /// pass — see `graph::chats`. Never a delta.
+    pub fn set_unread_count(&self, count: i64) -> Result<(), PushError> {
         self.client
             .put(format!("{}/api/teams", self.base_url))
             .bearer_auth(&self.api_key)
-            .json(body)
+            .json(&SetUnreadCount { count })
+            .send()?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Raises the board's incoming-call banner. The server holds this as an
+    /// ephemeral singleton — no history, no retention.
+    pub fn put_call(&self, caller: &str) -> Result<(), PushError> {
+        self.client
+            .put(format!("{}/api/call", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&PutCallBody {
+                caller: caller.to_string(),
+            })
+            .send()?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Clears the call banner server-side (e.g. once the ring stops).
+    pub fn clear_call(&self) -> Result<(), PushError> {
+        self.client
+            .delete(format!("{}/api/call", self.base_url))
+            .bearer_auth(&self.api_key)
             .send()?
             .error_for_status()?;
         Ok(())
@@ -61,7 +88,7 @@ impl WorkDashClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{CalendarEventIn, TeamsKind};
+    use crate::models::CalendarEventIn;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::thread;
@@ -147,12 +174,14 @@ mod tests {
                 place: None,
                 is_cancelled: false,
             }],
+            range_start: "2026-07-06T00:00:00Z".to_string(),
+            range_end: "2026-07-07T00:00:00Z".to_string(),
         };
         client.put_calendar(&body).unwrap();
     }
 
     #[test]
-    fn put_teams_sends_expected_method_auth_and_body() {
+    fn set_unread_count_sends_absolute_count() {
         let url = serve_one(
             "HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\n{}",
             |method, path, headers, body| {
@@ -163,18 +192,40 @@ mod tests {
                     .any(|(k, v)| k.eq_ignore_ascii_case("authorization")
                         && v == "Bearer test-key"));
                 let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
-                assert_eq!(parsed["kind"], "call");
-                assert_eq!(parsed["text"], "Incoming call — Sarah Lee");
+                assert_eq!(parsed["count"], 4);
             },
         );
 
         let client = WorkDashClient::new(url, "test-key");
-        let body = TeamsEventIn {
-            kind: TeamsKind::Call,
-            text: "Incoming call — Sarah Lee".to_string(),
-            payload: Some(serde_json::json!({"caller": "Sarah Lee"})),
-        };
-        client.put_teams(&body).unwrap();
+        client.set_unread_count(4).unwrap();
+    }
+
+    #[test]
+    fn put_call_sends_caller_name() {
+        let url = serve_one(
+            "HTTP/1.1 204 No Content\r\n\r\n",
+            |method, path, _headers, body| {
+                assert_eq!(method, "PUT");
+                assert_eq!(path, "/api/call");
+                let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+                assert_eq!(parsed["caller"], "Sarah Lee");
+            },
+        );
+
+        let client = WorkDashClient::new(url, "test-key");
+        client.put_call("Sarah Lee").unwrap();
+    }
+
+    #[test]
+    fn clear_call_sends_delete_with_no_body() {
+        let url = serve_one("HTTP/1.1 204 No Content\r\n\r\n", |method, path, _, body| {
+            assert_eq!(method, "DELETE");
+            assert_eq!(path, "/api/call");
+            assert_eq!(body, "");
+        });
+
+        let client = WorkDashClient::new(url, "test-key");
+        client.clear_call().unwrap();
     }
 
     #[test]
@@ -190,11 +241,6 @@ mod tests {
             |_, _, _, _| {},
         );
         let client = WorkDashClient::new(url, "bad-key");
-        let body = TeamsEventIn {
-            kind: TeamsKind::Info,
-            text: "x".to_string(),
-            payload: None,
-        };
-        assert!(client.put_teams(&body).is_err());
+        assert!(client.put_call("x").is_err());
     }
 }
