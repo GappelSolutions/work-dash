@@ -111,15 +111,17 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     // Clock window: sized to the big digits.
     let big_w = bigtext::width(&time);
     let use_big = big_w + 4 <= area.width && area.height >= 16;
-    let clock_h = if use_big { 9 } else { 3 };
+    let clock_h = if use_big { 10 } else { 3 };
     let clock_w = window_width(area);
     let clock_h = clock_h.min(area.height);
 
     let lines: Vec<Line> = if use_big {
-        let mut l: Vec<Line> = bigtext::big_lines(&time)
-            .into_iter()
-            .map(|s| Line::from(s).style(Style::default().fg(Color::Cyan).bold()))
-            .collect();
+        let mut l: Vec<Line> = vec![Line::default()];
+        l.extend(
+            bigtext::big_lines(&time)
+                .into_iter()
+                .map(|s| Line::from(s).style(Style::default().fg(Color::Cyan).bold())),
+        );
         l.push(Line::default());
         l.push(Line::from(date.clone().gray()));
         l
