@@ -61,32 +61,36 @@ on first boot:**
 - **Physical mounting orientation** (rotation) — unknown until the panel is
   in its enclosure. See the commented block in `configuration.nix`.
 
-## Setup — flash and boot, no on-device steps
+## Setup — flash once, then auto-updates forever (no SSH, no KVM)
 
-Everything (server API key, wifi PSK) is baked into the image at **build**
-time, not decrypted on the Pi. Only whoever holds the private key listed in
-`secrets/secrets.nix` can produce a working image — nothing decrypts at
-runtime, so there's no separate per-device identity and no manual step on
-the Pi itself.
+The device has no SSH and no physical console access once deployed (public
+wifi only) — `system.autoUpgrade` (bottom of `configuration.nix`) polls the
+public `GappelSolutions/work-dash` repo daily (04:00 CH time, ±30min jitter)
+and rebuilds+switches on-device. Secrets decrypt at *activation* time via
+agenix, using a persistent age identity baked onto the SD image once at
+flash time — so pushing a new commit (code, config, or a rotated secret) is
+enough; there's nothing to do on the Pi itself ever again.
 
-1. One-time per builder: decrypt the two agenix secrets to
-   `~/.work-dash-pi-secrets/` (outside the repo — deliberately not a
-   `./secrets/...` flake-relative path, so it's never subject to the
-   flake's git-tracked-source purity check and can never accidentally be
-   committed):
+Only the **initial flash** needs the impure build step below, and only
+because of that one-time device-key bake:
+
+1. One-time ever (not per builder): generate the device's persistent age
+   identity and add it as a recipient so agenix can decrypt for it:
    ```sh
    mkdir -p ~/.work-dash-pi-secrets
-   agenix -d secrets/work-dash-pi.env.age -i ~/.ssh/id_ed25519 \
-     > ~/.work-dash-pi-secrets/work-dash-pi.env.plain
-   agenix -d secrets/wifi.env.age -i ~/.ssh/id_ed25519 \
-     > ~/.work-dash-pi-secrets/wifi.env.plain
-   chmod 600 ~/.work-dash-pi-secrets/*.plain
+   nix shell nixpkgs#age --command age-keygen -o ~/.work-dash-pi-secrets/device.key
+   chmod 600 ~/.work-dash-pi-secrets/device.key
    ```
-   (`-i` must be a private key whose matching public key is in
-   `secrets/secrets.nix`'s recipient list — add your own there and re-run
-   `agenix -r` if you need to build from a different machine.)
-2. Build the SD image (`--impure` is required — that's what lets
-   `configuration.nix` read the plaintext files above):
+   Copy the printed public key into `secrets/secrets.nix`'s `piDevice`
+   binding, then re-encrypt the existing secrets for it:
+   ```sh
+   cd secrets && agenix -r -i ~/.ssh/id_ed25519
+   ```
+   (`-i` must be a private key whose matching public key is already in
+   `secrets/secrets.nix`'s recipient list.)
+2. Build the SD image (`--impure` is required — this is the one build that
+   reads `~/.work-dash-pi-secrets/device.key` off the builder's disk, to
+   bake it onto the image's rootfs via `sdImage.populateRootCommands`):
    ```sh
    nix build --impure --accept-flake-config .#packages.aarch64-linux.sdImage
    # result/sd-image/*.img.zst — decompress and dd/Raspberry Pi Imager it
@@ -100,10 +104,11 @@ the Pi itself.
    page shows a red "SERVER UNREACHABLE" banner instead of failing silently
    (`client/src/ui/clock.rs`).
 
-For an already-installed system reachable over SSH instead of reflashing:
-```sh
-nixos-rebuild switch --impure --flake .#dashboard --target-host root@<pi-ip>
-```
+From here on, editing `secrets/*.age` (re-encrypt with `agenix -e`, no need
+to touch the device key) or anything else in `nixos/` and pushing to `main`
+is enough — the Pi picks it up on its next poll, no reflash, no SSH.
+Re-flashing is only needed again if the device's age identity itself is
+ever rotated (it isn't managed by ongoing rebuilds, by design).
 
 ### Flashing from Windows when the image was built in WSL
 
@@ -182,15 +187,24 @@ distro's cap.
 
 ## Files
 
-- `flake.nix` — inputs (`nixpkgs`, `nixos-raspberrypi`), the
+- `flake.nix` — inputs (`nixpkgs`, `nixos-raspberrypi`, `agenix`), the
   `nixosConfigurations.dashboard` output, and `packages.aarch64-linux.sdImage`
   (wires in `nixos-raspberrypi`'s `sd-image-raspberrypi.nix` for
   `config.system.build.sdImage`).
 - `configuration.nix` — display/touch setup, the `work-dash-client` Nix
   package (built from this repo's workspace), the `greetd` → `cage` →
-  `foot` kiosk session, wifi, and the build-time secrets wiring.
-- `secrets/secrets.nix` — agenix recipient list (who can decrypt/build).
+  `foot` kiosk session, wifi, the agenix-decrypted secrets wiring, the
+  one-time device-key bake (`sdImage.populateRootCommands`), and
+  `system.autoUpgrade`.
+- `secrets/secrets.nix` — agenix recipient list: the builder key (can
+  edit/re-encrypt secrets from a dev machine) and `piDevice` (the Pi's own
+  age identity, baked into the image once at flash time — see "Setup"
+  above).
 - `secrets/work-dash-pi.env.age`, `secrets/wifi.env.age` — encrypted
-  `WORK_DASH_SERVER_URL`/`WORK_DASH_API_KEY` and `WIFI_PSK`. Edit with
-  `agenix -e <file> -i <your private key>` from `secrets/`; re-encrypt for a
-  new recipient with `agenix -r -i <a-key-already-in-secrets.nix>`.
+  `WORK_DASH_SERVER_URL`/`WORK_DASH_API_KEY` and `WIFI_PSK`, decrypted
+  on-device by agenix at activation time (not baked in at build time
+  anymore). Edit with `agenix -e <file> -i <your private key>` from
+  `secrets/`; re-encrypt for a new recipient with
+  `agenix -r -i <a-key-already-in-secrets.nix>`. A push to `main` is
+  enough to roll a secret change out — the Pi picks it up on its next
+  `autoUpgrade` poll.

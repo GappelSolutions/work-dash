@@ -4,6 +4,8 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     nixos-raspberrypi.url = "github:nvmd/nixos-raspberrypi/main";
+    agenix.url = "github:ryantm/agenix";
+    agenix.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   nixConfig = {
@@ -11,7 +13,7 @@
     extra-trusted-public-keys = [ "nixos-raspberrypi.cachix.org-1:4iMO9LXa8BqhU+Rpg6LQKiGa2lsNh/j2oiYLNOQ5sPI=" ];
   };
 
-  outputs = { self, nixpkgs, nixos-raspberrypi, ... }@inputs:
+  outputs = { self, nixpkgs, nixos-raspberrypi, agenix, ... }@inputs:
     let
       system = "aarch64-linux";
     in
@@ -43,6 +45,7 @@
           # still needs interactive wifi/first-boot setup — everything's
           # already baked in via configuration.nix).
           "${nixos-raspberrypi}/modules/installer/sd-card/sd-image-raspberrypi.nix"
+          agenix.nixosModules.default
           ./configuration.nix
         ];
       };

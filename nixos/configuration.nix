@@ -5,7 +5,7 @@ let
   # filename (sdImage.imageBaseName below) so a stale image in
   # nixos/result/sd-image/ or on the Windows side is never mistaken for the
   # latest one.
-  imageVersion = "8";
+  imageVersion = "9";
 
   # Wifi confirmed working on real hardware (v6 debug pass) — kiosk back on
   # for the real validation run.
@@ -14,7 +14,11 @@ let
   # Outside the repo entirely (not a flake-relative `./...` path) so it's
   # never subject to the flake's git-tracked-source purity check — reading
   # it needs `--impure` (see nixos/README.md for the required pre-build
-  # decrypt step and the exact build command).
+  # decrypt step and the exact build command). Only used for the device's
+  # persistent age identity now (see sdImage.populateRootCommands below) —
+  # everything else decrypts on-device via agenix at activation time, so
+  # `system.autoUpgrade` can pull+apply new secrets with no rebuild-time
+  # impurity and no access to the Pi itself.
   secretsDir = builtins.getEnv "HOME" + "/.work-dash-pi-secrets";
 
   # Packaged straight from this repo's Cargo workspace so the Pi image always
@@ -96,39 +100,45 @@ EOF
     bright7 = ffffff
   '';
 
-  # Decrypted once at build time (not on the Pi — see nixos/README.md) from
-  # ./secrets/work-dash-pi.env.age into ~/.work-dash-pi-secrets/, which this
-  # config then bakes into the image. `set -a` exports every var the file
-  # defines into the kiosk command's environment. Only whoever holds the
-  # private key in ./secrets/secrets.nix's recipient list can produce the
-  # plaintext, so only they can build a working image — no key material of
-  # any kind ends up in git or on the Pi itself.
+  # The device's persistent age identity, generated once
+  # (~/.work-dash-pi-secrets/device.key, git-ignored) and baked straight onto
+  # the SD image's rootfs at build time via sdImage.populateRootCommands
+  # below — NOT declared as environment.etc, deliberately, so ordinary
+  # NixOS activation (including future `nixos-rebuild switch` runs
+  # triggered by system.autoUpgrade) never touches or re-derives this path.
+  # It's the one thing that only exists because of the initial flash;
+  # everything else (env vars, wifi PSK) flows through agenix from here on
+  # and can be updated over git with no on-device/SSH step.
   #
-  # `environment.etc.source` with a raw path outside the store does NOT copy
-  # the content in — it just symlinks to that literal path, which only
-  # exists on the builder's machine. On the Pi that symlink is dangling, so
-  # the env vars silently never load. `writeText`+`readFile` forces the
-  # actual content into the store so it lands in the image.
-  envFile = "/etc/work-dash/env";
-  workDashEnvContent = pkgs.writeText "work-dash-env"
-    (builtins.readFile (secretsDir + "/work-dash-pi.env.plain"));
+  # Must go through `writeText`+`readFile` (impure eval, not a raw path) —
+  # the sd-image build runs in a sandbox with no access to arbitrary host
+  # paths like `$HOME`; only real store paths are visible inside it. This
+  # is the same fix `workDashEnvContent` needed before it was replaced by
+  # agenix above.
+  deviceKeyFile = pkgs.writeText "device-key"
+    (builtins.readFile (secretsDir + "/device.key"));
 
 in
 {
   ###########################################################################
-  # Secrets — baked in at build time (see nixos/README.md for the required
-  # pre-build decrypt step and `--impure` build flag); nothing to configure
-  # on the Pi itself.
+  # Secrets — encrypted files ship in git; agenix decrypts them at
+  # activation time on the Pi itself using the device identity above, so
+  # `system.autoUpgrade` can pick up secret changes with no rebuild-time
+  # impurity and no access to the device. See nixos/README.md for the
+  # one-time device-key generation + image-flash step.
   ###########################################################################
 
-  environment.etc."work-dash/env" = {
-    source = workDashEnvContent;
-    # 0600 root-only was unreadable by the "kiosk" user the greetd session
-    # runs as — `source` failed silently (no `set -e`), so the vars never
-    # loaded even after the symlink fix above. Moot to restrict further
-    # anyway: the underlying /nix/store path is world-readable regardless
-    # of this mode, same tradeoff already accepted for workDashEnvContent.
+  age.identityPaths = [ "/etc/age/device.key" ];
+
+  age.secrets.workDashEnv = {
+    file = ./secrets/work-dash-pi.env.age;
+    # World-readable: the "kiosk" user the greetd session runs as needs to
+    # read this, and /run/agenix files default to 0400 root-only.
     mode = "0444";
+  };
+
+  age.secrets.wifiEnv = {
+    file = ./secrets/wifi.env.age;
   };
 
   ###########################################################################
@@ -166,13 +176,15 @@ in
 
   hardware.i2c.enable = lib.mkDefault true;
 
-  # Panel is 800x480. Uncomment and set if it's mounted upside-down/sideways —
-  # orientation is unknown until the panel is physically in its enclosure.
-  # services.xserver.deviceSection = "" ; # (not used — no X server here)
-  # See kiosk section below: `foot` inherits whatever rotation the compositor
-  # reports; `cage` itself has no rotation flag, so panel rotation (if needed)
-  # belongs in the KMS/DRM layer, e.g. a `video=DSI-1:panel_orientation=...`
-  # kernel param — TODO once the panel's physical mount is known.
+  # Panel is 800x480, mounted upside-down. `cage` has no rotation flag itself
+  # (wlroots draws whatever the DRM connector reports), so rotation belongs
+  # at the KMS/DRM layer — the `panel_orientation` connector property, set
+  # via this kernel param, flips console + Wayland output alike.
+  # TODO: touch input isn't remapped by this — the touch controller still
+  # reports raw (non-rotated) coordinates, so tap targets will be inverted
+  # until `libinput.calibrationMatrix` (or the touch overlay's own invx/invy/
+  # swapxy params, if the panel's overlay exposes them) is set to match.
+  boot.kernelParams = [ "video=DSI-1:panel_orientation=upside_down" ];
 
   ###########################################################################
   # Touch input
@@ -191,11 +203,11 @@ in
   };
 
   ###########################################################################
-  # Debug access — no SSH (device isn't networked yet, chicken-and-egg with
-  # the wifi bug this image is meant to validate), so a physical-keyboard
-  # login on another VT (Ctrl+Alt+F2 etc.) is the only way in. Without a
-  # password no account can log in at all — NixOS locks accounts with no
-  # hash by default, so this is required, not optional, for debugging.
+  # Debug access — deliberately no SSH; the device sits on a public/guest
+  # wifi network with no inbound reachability, so a physical-keyboard login
+  # on another VT (Ctrl+Alt+F2 etc.) is the only way in. Without a password
+  # no account can log in at all — NixOS locks accounts with no hash by
+  # default, so this is required, not optional, for debugging.
   # `initialPassword` only seeds it on first activation (won't stomp a
   # password you later change on-device via `passwd`), plain root login for
   # now since this device has no other user worth separating privileges for.
@@ -209,7 +221,7 @@ in
       command = ''
         ${pkgs.bash}/bin/bash -c '
           set -a
-          [ -f ${envFile} ] && source ${envFile}
+          [ -f ${config.age.secrets.workDashEnv.path} ] && source ${config.age.secrets.workDashEnv.path}
           XCURSOR_THEME=invisible
           XCURSOR_PATH=${invisibleCursorTheme}/share/icons
           XCURSOR_SIZE=1
@@ -244,18 +256,14 @@ in
   networking.hostName = "work-dash-pi";
   hardware.enableRedistributableFirmware = true; # Pi 4B wifi (brcmfmac) needs this
 
-  # wpa_supplicant reads WIFI_PSK via the ext: mechanism
-  # (`secretsFile`/`pskRaw`, replacing the older `environmentFile`/`psk`+
-  # "@VAR@" API). `secretsFile` ends up literally baked into
-  # wpa_supplicant.conf as `ext_password_backend=file:<path>` and is read
-  # from disk by wpa_supplicant at runtime *on the Pi* — a raw
-  # `secretsDir + "/wifi.env.plain"` path only exists on the builder's
-  # machine, so it must be a store path (via `writeText`) instead, same
-  # issue as `workDashEnvContent` above.
+  # wpa_supplicant reads WIFI_PSK via the ext: mechanism (`secretsFile`/
+  # `pskRaw`). `secretsFile` ends up literally baked into wpa_supplicant.conf
+  # as `ext_password_backend=file:<path>` and is read from disk by
+  # wpa_supplicant at runtime *on the Pi* — pointed at the agenix-decrypted
+  # path (/run/agenix/wifiEnv), populated at activation time on-device.
   networking.wireless = {
     enable = true;
-    secretsFile = pkgs.writeText "wifi-secrets"
-      (builtins.readFile (secretsDir + "/wifi.env.plain"));
+    secretsFile = config.age.secrets.wifiEnv.path;
     # `country` fixes brcmfmac "set chanspec ... fail reason -52" — with no
     # regulatory domain set, firmware defaults to a restrictive "world"
     # regdomain that rejects some channels outright.
@@ -286,4 +294,37 @@ in
   time.timeZone = "Europe/Zurich";
 
   image.baseName = lib.mkForce "work-dash-pi-v${imageVersion}";
+
+  ###########################################################################
+  # One-time device-key bake — writes the persistent age identity straight
+  # onto the SD image's rootfs at *image-build* time, outside the normal
+  # Nix store/activation graph. Because nothing in this config declares
+  # `/etc/age/device.key` via environment.etc, ordinary NixOS activation
+  # (including every future `nixos-rebuild switch`, whether run manually or
+  # by system.autoUpgrade below) never touches this path again after the
+  # initial flash — it just persists on disk.
+  ###########################################################################
+  sdImage.populateRootCommands = ''
+    mkdir -p ./files/etc/age
+    install -m 0600 ${deviceKeyFile} ./files/etc/age/device.key
+  '';
+
+  ###########################################################################
+  # Auto-update — polls the public flake repo daily, rebuilds+switches with
+  # no on-device/SSH step. Secrets flow through agenix (see above) so this
+  # also picks up secret changes, not just code/config. `--impure` is not
+  # needed here: unlike the initial image build, nothing in the ongoing
+  # rebuild reads outside the flake's git-tracked source anymore.
+  ###########################################################################
+  system.autoUpgrade = {
+    enable = true;
+    flake = "github:GappelSolutions/work-dash?dir=nixos#dashboard";
+    flags = [ "--accept-flake-config" ]; # trusts the nixos-raspberrypi cachix substituter
+    dates = "04:00";
+    randomizedDelaySec = "30min";
+    allowReboot = true;
+    # Kiosk sits idle overnight; a reboot mid-shift would black the panel
+    # out, so confine it to the same overnight window as the pull itself.
+    rebootWindow = { lower = "03:00"; upper = "05:00"; };
+  };
 }
