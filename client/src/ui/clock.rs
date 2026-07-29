@@ -116,11 +116,23 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let clock_h = clock_h.min(area.height);
 
     let lines: Vec<Line> = if use_big {
+        // Seconds rendered separately in orange — a deliberate, easy-to-spot
+        // marker while testing the NixOS OTA pipeline end to end; revert to
+        // a single Cyan span (like the old bigtext::big_lines(&time) call)
+        // once an auto-update landing on-device has been confirmed visually.
+        let (hm, secs) = time.split_at(time.len() - 2);
         let mut l: Vec<Line> = vec![Line::default()];
         l.extend(
-            bigtext::big_lines(&time)
+            bigtext::big_lines(hm)
                 .into_iter()
-                .map(|s| Line::from(s).style(Style::default().fg(Color::Cyan).bold())),
+                .zip(bigtext::big_lines(secs))
+                .map(|(hm_row, secs_row)| {
+                    Line::from(vec![
+                        Span::styled(hm_row, Style::default().fg(Color::Cyan).bold()),
+                        Span::raw("  "),
+                        Span::styled(secs_row, Style::default().fg(Color::Rgb(255, 140, 0)).bold()),
+                    ])
+                }),
         );
         l.push(Line::default());
         l.push(Line::from(date.clone().gray()));
