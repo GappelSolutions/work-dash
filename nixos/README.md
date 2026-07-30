@@ -58,8 +58,27 @@ on first boot:**
   auto-init via the DSI EEPROM and need nothing extra; if the screen stays
   blank or touch doesn't register, check `dmesg | grep -iE 'drm|i2c|touch'`
   and look for the vendor's actual overlay name.
-- **Physical mounting orientation** (rotation) — unknown until the panel is
-  in its enclosure. See the commented block in `configuration.nix`.
+**Confirmed on real hardware:**
+- **Physical mounting orientation** is upside-down. Fixed via
+  `boot.kernelParams = [ "video=DSI-1:panel_orientation=upside_down" ]` in
+  `configuration.nix` — this flips the KMS/DRM output (console + Wayland
+  alike), console + cage. It does **not** touch the touchscreen: the touch
+  controller keeps reporting raw, non-rotated coordinates, so taps land
+  diagonally opposite the visible tap target unless matched separately.
+  Matched via a `services.udev.extraRules` rule setting
+  `LIBINPUT_CALIBRATION_MATRIX="-1 0 1 0 -1 1"` (a 180° transform) on
+  `ID_INPUT_TOUCHSCREEN=="1"` devices — see the "Touch input" section of
+  `configuration.nix`.
+  ⚠️ **If the mounting orientation (or the kernel param above) ever
+  changes, this calibration matrix must change with it** — display
+  rotation and touch calibration are two independent config surfaces
+  (KMS/DRM vs. libinput/udev) that don't sync automatically, and nothing
+  will error if they drift out of sync; the panel will simply mis-register
+  every tap. Also note: `services.libinput.touchpad.calibrationMatrix` is
+  **not** the right NixOS option here — it only feeds the X11
+  `xf86-input-libinput` driver (gated on `services.xserver.enable`), and
+  this kiosk runs `cage`/wlroots on Wayland with no X server at all; only
+  the udev-property route reaches libinput directly.
 
 ## Setup — flash once, then auto-updates forever (no SSH, no KVM)
 

@@ -179,11 +179,9 @@ in
   # Panel is 800x480, mounted upside-down. `cage` has no rotation flag itself
   # (wlroots draws whatever the DRM connector reports), so rotation belongs
   # at the KMS/DRM layer — the `panel_orientation` connector property, set
-  # via this kernel param, flips console + Wayland output alike.
-  # TODO: touch input isn't remapped by this — the touch controller still
-  # reports raw (non-rotated) coordinates, so tap targets will be inverted
-  # until `libinput.calibrationMatrix` (or the touch overlay's own invx/invy/
-  # swapxy params, if the panel's overlay exposes them) is set to match.
+  # via this kernel param, flips console + Wayland output alike. Touch input
+  # isn't remapped by this — see the udev calibration rule under "Touch
+  # input" below.
   boot.kernelParams = [ "video=DSI-1:panel_orientation=upside_down" ];
 
   ###########################################################################
@@ -191,6 +189,20 @@ in
   ###########################################################################
 
   services.libinput.enable = true;
+
+  # Panel is rotated 180° at the KMS layer (see panel_orientation above), but
+  # the touch controller still reports raw (non-rotated) coordinates, so taps
+  # land diagonally opposite where they should. `services.libinput.touchpad.
+  # calibrationMatrix` is NOT the fix here — that option only feeds the X11
+  # `xf86-input-libinput` driver config (gated on `services.xserver.enable`),
+  # and this kiosk is cage/wlroots on Wayland with no X server at all. libinput
+  # itself (used directly by wlroots) reads calibration from the
+  # `LIBINPUT_CALIBRATION_MATRIX` udev property instead, so it has to be set
+  # via a udev rule. 6 numbers = first two rows of the 3x3 transform matrix
+  # (row 3 is implicitly "0 0 1"); "-1 0 1 0 -1 1" is a 180° rotation.
+  services.udev.extraRules = ''
+    SUBSYSTEM=="input", ENV{ID_INPUT_TOUCHSCREEN}=="1", ENV{LIBINPUT_CALIBRATION_MATRIX}="-1 0 1 0 -1 1"
+  '';
 
   ###########################################################################
   # Kiosk: greetd autologin -> cage (fullscreen Wayland compositor) -> foot
